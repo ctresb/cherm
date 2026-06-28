@@ -98,26 +98,37 @@ func (c *Core) Start() error {
 	return nil
 }
 
-// readLoop scans the core's stdout line by line, parses each JSON event, and
-// forwards it to bubbletea. It uses a large buffer because a single history
-// event can carry many messages.
+// readLoop reads the core's stdout one NDJSON frame at a time, parses each into
+// a typed event, and forwards it to bubbletea. It uses a bufio.Reader (not a
+// bufio.Scanner) so a single oversized frame can never crash the reader: a
+// Scanner has a fixed token cap and fails the whole stream with ErrTooLong on a
+// long line, which would tear down the TUI. ReadBytes grows as needed, and an
+// unparseable frame is simply skipped — the loop only stops on a real EOF/error.
 func (c *Core) readLoop() {
-	scanner := bufio.NewScanner(c.stdout)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	reader := bufio.NewReaderSize(c.stdout, 1024*1024)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-		if msg := parseEvent(line); msg != nil && c.prog != nil {
-			c.prog.Send(msg)
-		}
-	}
+	for {
+		line, err := reader.ReadBytes('\n')
 
-	// stdout closed: the core has exited (or errored). Notify the model.
-	if c.prog != nil {
-		c.prog.Send(coreClosedMsg{err: scanner.Err()})
+		// A partial trailing line (no newline) can still accompany io.EOF, so
+		// process whatever we got before deciding to stop.
+		if len(bytes.TrimSpace(line)) > 0 {
+			if msg := parseEvent(line); msg != nil && c.prog != nil {
+				c.prog.Send(msg)
+			}
+		}
+
+		if err != nil {
+			// stdout closed (io.EOF) or a transport error: the core has exited.
+			if c.prog != nil {
+				if err == io.EOF {
+					c.prog.Send(coreClosedMsg{err: nil})
+				} else {
+					c.prog.Send(coreClosedMsg{err: err})
+				}
+			}
+			return
+		}
 	}
 }
 

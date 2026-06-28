@@ -9,6 +9,17 @@ import "encoding/json"
 // an "event" discriminator; parseEvent decodes a line into a typed tea.Msg so
 // the model can switch on a concrete Go type instead of poking at maps.
 
+// ServerInfo is one entry in the known-servers list ("ready" / "servers"
+// events). Username is the empty string when no account exists on that server.
+type ServerInfo struct {
+	ID       string `json:"id"`
+	Addr     string `json:"addr"`
+	Tier     string `json:"tier"`    // "unsigned" | "software" | "tee"
+	Verdict  string `json:"verdict"` // "green" | "yellow" | "red"
+	Username string `json:"username"`
+	Active   bool   `json:"active"`
+}
+
 // ChatInfo is one entry in the sidebar chat list (the "chats" event).
 type ChatInfo struct {
 	ID     string `json:"id"`
@@ -29,32 +40,50 @@ type Message struct {
 // --- typed tea.Msg values delivered to the model ---
 
 type readyMsg struct {
-	registered bool
-	username   string
+	servers   []ServerInfo
+	hasMaster bool
 }
 
-type statusMsg struct {
-	connected  bool
-	registered bool
-	username   string
+type serversMsg struct {
+	servers []ServerInfo
+}
+
+// attestMsg carries an attestation verdict for a server (the "attest" event).
+type attestMsg struct {
+	server            string
+	verdict           string // "green" | "yellow" | "red"
+	tier              string // "unsigned" | "software" | "tee"
+	reason            string
+	buildHash         string
+	fingerprint       string
+	publicCodebaseURL string
+	signaturesURL     string
+}
+
+type needUsernameMsg struct {
+	server string
 }
 
 type registeredMsg struct {
+	server   string
 	username string
 	uuid     string
 }
 
 type connectedMsg struct {
+	server   string
 	username string
-	uuid     string
+	active   bool
 }
 
 type disconnectedMsg struct {
+	server string
 	reason string
 }
 
 type chatsMsg struct {
-	chats []ChatInfo
+	server string
+	chats  []ChatInfo
 }
 
 type historyMsg struct {
@@ -69,6 +98,12 @@ type messageMsg struct {
 	ts       int64
 	outgoing bool
 	color    string
+}
+
+// fingerprintMsg carries a peer's safety number (the "fingerprint" event).
+type fingerprintMsg struct {
+	username    string
+	fingerprint string
 }
 
 type errorMsg struct {
@@ -97,14 +132,26 @@ type coreClosedMsg struct {
 type coreEvent struct {
 	Event string `json:"event"`
 
-	// ready / status / registered / connected
-	Registered bool   `json:"registered"`
-	Connected  bool   `json:"connected"`
-	Username   string `json:"username"`
-	UUID       string `json:"uuid"`
+	// ready / servers
+	Servers   []ServerInfo `json:"servers"`
+	HasMaster bool         `json:"has_master"`
 
-	// disconnected
-	Reason string `json:"reason"`
+	// identity / connection state
+	Username string `json:"username"`
+	UUID     string `json:"uuid"`
+	Active   bool   `json:"active"`
+
+	// server-scoped events (attest / need_username / connected / chats / pong …)
+	Server string `json:"server"`
+
+	// attest
+	Verdict           string `json:"verdict"`
+	Tier              string `json:"tier"`
+	Reason            string `json:"reason"` // also reused by "disconnected"
+	BuildHash         string `json:"build_hash"`
+	Fingerprint       string `json:"fingerprint"` // also reused by "fingerprint"
+	PublicCodebaseURL string `json:"public_codebase_url"`
+	SignaturesURL     string `json:"signatures_url"`
 
 	// chats
 	Chats []ChatInfo `json:"chats"`
@@ -127,8 +174,6 @@ type coreEvent struct {
 
 	// pong
 	RttMs int64 `json:"rtt_ms"`
-	// (the "server" field reuses Username's sibling below; declared explicitly)
-	Server string `json:"server"`
 }
 
 // parseEvent decodes one NDJSON line into a typed tea.Msg. It returns nil for
@@ -140,17 +185,30 @@ func parseEvent(line []byte) any {
 	}
 	switch e.Event {
 	case "ready":
-		return readyMsg{registered: e.Registered, username: e.Username}
-	case "status":
-		return statusMsg{connected: e.Connected, registered: e.Registered, username: e.Username}
+		return readyMsg{servers: e.Servers, hasMaster: e.HasMaster}
+	case "servers":
+		return serversMsg{servers: e.Servers}
+	case "attest":
+		return attestMsg{
+			server:            e.Server,
+			verdict:           e.Verdict,
+			tier:              e.Tier,
+			reason:            e.Reason,
+			buildHash:         e.BuildHash,
+			fingerprint:       e.Fingerprint,
+			publicCodebaseURL: e.PublicCodebaseURL,
+			signaturesURL:     e.SignaturesURL,
+		}
+	case "need_username":
+		return needUsernameMsg{server: e.Server}
 	case "registered":
-		return registeredMsg{username: e.Username, uuid: e.UUID}
+		return registeredMsg{server: e.Server, username: e.Username, uuid: e.UUID}
 	case "connected":
-		return connectedMsg{username: e.Username, uuid: e.UUID}
+		return connectedMsg{server: e.Server, username: e.Username, active: e.Active}
 	case "disconnected":
-		return disconnectedMsg{reason: e.Reason}
+		return disconnectedMsg{server: e.Server, reason: e.Reason}
 	case "chats":
-		return chatsMsg{chats: e.Chats}
+		return chatsMsg{server: e.Server, chats: e.Chats}
 	case "history":
 		return historyMsg{chat: e.Chat, messages: e.Messages}
 	case "message":
@@ -162,6 +220,8 @@ func parseEvent(line []byte) any {
 			outgoing: e.Outgoing,
 			color:    e.Color,
 		}
+	case "fingerprint":
+		return fingerprintMsg{username: e.Username, fingerprint: e.Fingerprint}
 	case "error":
 		return errorMsg{message: e.Message, code: e.Code}
 	case "info":

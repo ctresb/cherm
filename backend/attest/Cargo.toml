@@ -1,0 +1,22 @@
+[package]
+name = "cherm-attest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+hex.workspace = true
+blake3.workspace = true
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+# AWS Nitro TEE quote verification (pure-Rust)
+coset.workspace = true
+ciborium.workspace = true
+serde_bytes.workspace = true
+p384 = { workspace = true, features = ["ecdsa", "pem"] }
+x509-cert.workspace = true

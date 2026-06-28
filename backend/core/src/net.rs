@@ -1,26 +1,32 @@
-//! Server connection: framing, the writer/reader tasks, and the
-//! single-outstanding control-response channel.
+//! Per-server connection: framing, the writer/reader/processor tasks, and the
+//! single-outstanding control-response channel (PROTOCOL.md section 2).
 //!
-//! Wire protocol (PROTOCOL.md section 2) is length-prefixed JSON via
-//! `cherm_proto::{read_msg, write_msg}`. We split a `TcpStream` into halves:
+//! Each server connection splits one `TcpStream` into halves:
 //!
 //! - The **write half** is owned by a dedicated task fed by an
-//!   `mpsc<ClientMsg>` ([`ServerLink::tx`]). Anyone can send by cloning the
-//!   sender.
-//! - The **read half** is owned by the reader task ([`spawn_reader`]). It reads
-//!   `ServerMsg` frames forever. `Deliver` frames are end-to-end-encrypted
-//!   payloads addressed to us, so they go to [`process_incoming`]. Everything
-//!   else (`Challenge`, `AuthOk`, `UserInfo`, `Ok`, `Error`, `Pong`) is a
-//!   control response and fulfills the single pending oneshot.
+//!   `mpsc<ClientMsg>` ([`ServerLink::tx`]); anyone can send by cloning it.
+//! - The **read half** is owned by the **reader task** ([`spawn_reader`]). It
+//!   reads `ServerMsg` frames forever. `Deliver` frames are forwarded to a
+//!   single **processor task**; every other frame (`Challenge`, `AuthOk`,
+//!   `PrekeyBundle`, `Ok`, `Error`, `Pong`, ...) is a control response and
+//!   fulfills the one pending [`oneshot`].
 //!
-//! Because the TUI feeds us commands sequentially, there is at most ONE
-//! in-flight control request at a time, so a single shared
-//! `Option<oneshot::Sender<ServerMsg>>` slot is sufficient.
+//! Why a separate processor task? Decrypting an incoming Olm message from a
+//! brand-new peer may require a `FetchPrekeys` round-trip — i.e. it must
+//! `send_and_wait`. If the reader did that itself it would deadlock (it is the
+//! only thing that reads + routes the reply). So the reader hands Delivers to a
+//! single serialized processor that can freely `send_and_wait`; the reader keeps
+//! pumping the socket and routes the reply. One processor ⇒ messages are
+//! processed in order and Olm/Megolm ratchets never race.
+//!
+//! `send_and_wait` serializes requesters with [`ServerLink::control`] so there
+//! is only ever ONE outstanding control request (command handlers AND the
+//! processor share it). On disconnect the reader drains the pending oneshot so a
+//! parked `send_and_wait` resolves with an error instead of hanging.
 
 use anyhow::{anyhow, Result};
-use cherm_crypto::Identity;
 use cherm_proto::{read_msg, write_msg, ClientMsg, ServerMsg};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::net::tcp::OwnedReadHalf;
@@ -28,41 +34,30 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
-use crate::db::{self, Db};
 use crate::ipc::Events;
+use crate::vault::{self, Vault};
 
 /// The slot holding the single outstanding control-response sender.
 pub type Pending = Arc<AsyncMutex<Option<oneshot::Sender<ServerMsg>>>>;
 
-/// Handle to a live server connection. Cheaply cloneable (a channel sender and
-/// an `Arc`), so command handlers can grab a copy without borrowing `App`.
+/// Handle to a live server connection. Cheaply cloneable so command handlers and
+/// the processor can grab a copy without borrowing `App`.
 #[derive(Clone)]
 pub struct ServerLink {
     /// Send a `ClientMsg` to the server (consumed by the writer task).
     pub tx: mpsc::UnboundedSender<ClientMsg>,
     /// The single-outstanding control-response slot.
     pub pending: Pending,
-}
-
-/// The on-the-wire JSON wrapped inside a sealed `group_invite` payload. It
-/// carries the group key and roster so the recipient can join the room.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GroupInvite {
-    pub group_id: String,
-    pub name: String,
-    /// base64 of the 32-byte group key.
-    pub key: String,
-    /// Full member roster (including the creator).
-    pub members: Vec<String>,
+    /// Serializes requesters so only one control request is in flight at a time.
+    pub control: Arc<AsyncMutex<()>>,
 }
 
 /// Connect to `addr`, split the stream, and spawn the writer task. Returns the
-/// read half (for the caller to hand to [`spawn_reader`]) plus a [`ServerLink`].
+/// read half (for [`spawn_reader`]) plus a [`ServerLink`].
 pub async fn open(addr: &str) -> Result<(OwnedReadHalf, ServerLink)> {
     let stream = TcpStream::connect(addr).await?;
     let (read_half, mut write_half) = stream.into_split();
 
-    // Writer task: drain ClientMsgs and frame them onto the socket.
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -74,13 +69,21 @@ pub async fn open(addr: &str) -> Result<(OwnedReadHalf, ServerLink)> {
         tracing::debug!("server writer task exiting");
     });
 
-    let pending: Pending = Arc::new(AsyncMutex::new(None));
-    Ok((read_half, ServerLink { tx, pending }))
+    Ok((
+        read_half,
+        ServerLink {
+            tx,
+            pending: Arc::new(AsyncMutex::new(None)),
+            control: Arc::new(AsyncMutex::new(())),
+        },
+    ))
 }
 
-/// Send a `ClientMsg` and await the single control response. Installs the
-/// oneshot BEFORE sending so the reader can never beat us to it.
+/// Send a `ClientMsg` and await the single control response. Holds the control
+/// lock so concurrent requesters (command handlers + the processor) serialize,
+/// and installs the oneshot BEFORE sending so the reader can never beat us.
 pub async fn send_and_wait(link: &ServerLink, msg: ClientMsg) -> Result<ServerMsg> {
+    let _guard = link.control.lock().await;
     let (otx, orx) = oneshot::channel();
     {
         let mut slot = link.pending.lock().await;
@@ -98,39 +101,85 @@ pub async fn send_and_wait(link: &ServerLink, msg: ClientMsg) -> Result<ServerMs
 pub fn send(link: &ServerLink, msg: ClientMsg) -> Result<()> {
     link.tx
         .send(msg)
-        .map_err(|_| anyhow!("server connection closed"))?;
-    Ok(())
+        .map_err(|_| anyhow!("server connection closed"))
 }
 
-/// Everything the reader task needs to decrypt and persist incoming traffic.
-pub struct ReaderCtx {
-    pub identity: Arc<Identity>,
-    pub db: Db,
-    pub events: Events,
-    pub pending: Pending,
-    /// Our own username (used to record ourselves as a DM member).
-    pub me: String,
+/// A delivered ciphertext frame, forwarded reader → processor.
+struct Incoming {
+    from: String,
+    msg_type: String,
+    payload: String,
+    group_id: Option<String>,
+    client_ts: i64,
 }
 
-/// Spawn the reader loop. Returns its `JoinHandle` so the caller can `.abort()`
-/// it if the connection is being torn down or auth fails.
-pub fn spawn_reader(mut read_half: OwnedReadHalf, ctx: ReaderCtx) -> JoinHandle<()> {
+/// Everything the processor needs to decrypt, persist and surface traffic.
+#[derive(Clone)]
+struct ProcCtx {
+    vault: Vault,
+    vault_key: [u8; 32],
+    link: ServerLink,
+    events: Events,
+    /// Our own username (recorded as a DM member).
+    me: String,
+    /// This server's address (for `server`-tagged events).
+    addr: String,
+}
+
+/// Spawn the processor + reader for one connection. Returns the reader's
+/// `JoinHandle` so the caller can `.abort()` it (dropping the reader closes the
+/// processor channel, which ends the processor too).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_reader(
+    mut read_half: OwnedReadHalf,
+    link: ServerLink,
+    vault: Vault,
+    vault_key: [u8; 32],
+    events: Events,
+    me: String,
+    addr: String,
+) -> JoinHandle<()> {
+    let pending = link.pending.clone();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
+
+    let ctx = ProcCtx {
+        vault,
+        vault_key,
+        link,
+        events: events.clone(),
+        me,
+        addr: addr.clone(),
+    };
+    tokio::spawn(processor_loop(in_rx, ctx));
+
     tokio::spawn(async move {
         loop {
-            let msg: ServerMsg = match read_msg(&mut read_half).await {
-                Ok(m) => m,
+            // Read the frame as untyped JSON FIRST. `read_msg` consumes exactly
+            // the framed bytes regardless of shape, so a well-framed JSON frame
+            // that does not match `ServerMsg` (unknown variant / missing field)
+            // leaves the stream IN SYNC and we can recover from it. Only a true
+            // I/O error, EOF, oversized frame or non-JSON body is fatal for this
+            // connection.
+            let value: serde_json::Value = match read_msg(&mut read_half).await {
+                Ok(v) => v,
                 Err(e) => {
                     tracing::info!("server reader closed: {e}");
-                    // Wake any in-flight control request: its reply will never
-                    // arrive now, so drop the parked oneshot sender to make the
-                    // awaiting `send_and_wait` resolve with an error instead of
-                    // hanging forever (which would freeze the command loop).
-                    if let Some(tx) = ctx.pending.lock().await.take() {
+                    // Wake any parked control request so `send_and_wait` resolves
+                    // with an error instead of hanging the command loop.
+                    if let Some(tx) = pending.lock().await.take() {
                         drop(tx);
                     }
-                    ctx.events
-                        .emit(json!({"event": "disconnected", "reason": e.to_string()}));
+                    events.emit(json!({"event": "disconnected", "server": addr, "reason": e.to_string()}));
                     break;
+                }
+            };
+            // A single malformed/unknown frame must NEVER tear down (or crash)
+            // the reader: the stream is still in sync, so log it and keep going.
+            let msg: ServerMsg = match serde_json::from_value(value) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("ignoring malformed/unknown server frame: {e}");
+                    continue;
                 }
             };
 
@@ -143,117 +192,220 @@ pub fn spawn_reader(mut read_half: OwnedReadHalf, ctx: ReaderCtx) -> JoinHandle<
                     client_ts,
                     ..
                 } => {
-                    if let Err(e) = process_incoming(
-                        &ctx,
-                        &from,
-                        &msg_type,
-                        &payload,
-                        group_id.as_deref(),
+                    // Hand off to the serialized processor; never block the reader.
+                    let _ = in_tx.send(Incoming {
+                        from,
+                        msg_type,
+                        payload,
+                        group_id,
                         client_ts,
-                    ) {
-                        // Never crash the loop on a bad/undecryptable frame.
-                        tracing::warn!("incoming delivery failed: {e}");
-                        ctx.events
-                            .emit(json!({"event": "error", "code": "decrypt_failed", "message": e.to_string()}));
-                    }
+                    });
                 }
-                // Any non-Deliver frame is a control response: fulfill the
-                // pending oneshot installed by `send_and_wait`.
                 other => {
-                    let mut slot = ctx.pending.lock().await;
+                    let mut slot = pending.lock().await;
                     if let Some(tx) = slot.take() {
                         let _ = tx.send(other);
                     } else {
-                        tracing::warn!("unsolicited control message: {:?}", other);
+                        tracing::warn!("unsolicited control message: {other:?}");
                     }
                 }
             }
         }
+        // `in_tx` drops here → the processor's channel closes → processor ends.
     })
 }
 
-/// Decrypt, persist, and surface a single delivered frame. Returns an error on
-/// any decryption/parse failure; the caller logs + emits and keeps going.
-fn process_incoming(
-    ctx: &ReaderCtx,
-    from: &str,
-    msg_type: &str,
-    payload: &str,
-    group_id: Option<&str>,
-    client_ts: i64,
-) -> Result<()> {
-    match msg_type {
-        // 1:1 sealed box addressed to us.
-        "msg" => {
-            let plaintext = ctx.identity.unseal(&cherm_crypto::b64_decode(payload)?)?;
-            let text = String::from_utf8(plaintext)?;
-
-            // Lazily materialize a DM chat keyed by the sender's username.
-            let new_chat = !db::chat_exists(&ctx.db, from)?;
-            db::upsert_chat(&ctx.db, from, "dm", from, None)?;
-            db::add_member(&ctx.db, from, &ctx.me)?;
-            db::add_member(&ctx.db, from, from)?;
-            db::insert_message(&ctx.db, from, from, &text, client_ts, 0)?;
-
-            if new_chat {
-                // The chat set changed: refresh the sidebar.
-                ctx.events.emit(db::build_chats_event(&ctx.db)?);
-            }
-            ctx.events.emit(json!({
-                "event": "message", "chat": from, "from": from,
-                "text": text, "ts": client_ts, "outgoing": false, "color": null
-            }));
+/// The single processor task: drains delivered frames in order. Each is decrypted
+/// and persisted; a bad/undecryptable frame is logged + surfaced but never
+/// crashes the loop.
+async fn processor_loop(mut rx: mpsc::UnboundedReceiver<Incoming>, ctx: ProcCtx) {
+    while let Some(inc) = rx.recv().await {
+        if let Err(e) = process_one(&ctx, &inc).await {
+            tracing::warn!("incoming delivery failed: {e}");
+            ctx.events
+                .emit(json!({"event": "error", "code": "decrypt_failed", "message": e.to_string()}));
         }
+    }
+    tracing::debug!("processor task exiting");
+}
 
-        // A group key + roster, sealed to our X25519 key.
-        "group_invite" => {
-            let raw = ctx.identity.unseal(&cherm_crypto::b64_decode(payload)?)?;
-            let invite: GroupInvite = serde_json::from_slice(&raw)?;
+/// The on-the-wire JSON inside an `olm_group_key` payload: a Megolm session key
+/// shared over the pairwise Olm channel.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GroupKeyShare {
+    group_id: String,
+    name: String,
+    session_key: String,
+    sender_curve: String,
+    members: Vec<String>,
+}
 
-            db::upsert_chat(
-                &ctx.db,
-                &invite.group_id,
-                "group",
-                &invite.name,
-                Some(invite.key.clone()),
-            )?;
-            for member in &invite.members {
-                db::add_member(&ctx.db, &invite.group_id, member)?;
-            }
-
-            ctx.events.emit(db::build_chats_event(&ctx.db)?);
-            ctx.events.emit(
-                json!({"event": "info", "message": format!("added to group {}", invite.name)}),
-            );
+async fn process_one(ctx: &ProcCtx, inc: &Incoming) -> Result<()> {
+    match inc.msg_type.as_str() {
+        // An Olm DM (plaintext is the message text).
+        "olm" => {
+            let plaintext = obtain_olm_plaintext(ctx, &inc.from, &inc.payload).await?;
+            deliver_dm_text(ctx, &inc.from, &plaintext, inc.client_ts)?;
         }
-
-        // A symmetric group message; decrypt with the stored group key.
-        "group_msg" => {
-            let gid = group_id.ok_or_else(|| anyhow!("group_msg missing group_id"))?;
-            let (_kind, group_key) = db::get_chat(&ctx.db, gid)?
-                .ok_or_else(|| anyhow!("group_msg for unknown group {gid}"))?;
-            let group_key = group_key.ok_or_else(|| anyhow!("group {gid} has no key"))?;
-            let key = group_key_from_b64(&group_key)?;
-
-            let blob = cherm_crypto::b64_decode(payload)?;
-            let text = String::from_utf8(cherm_crypto::group_decrypt(&key, &blob)?)?;
-
-            db::insert_message(&ctx.db, gid, from, &text, client_ts, 0)?;
-            ctx.events.emit(json!({
-                "event": "message", "chat": gid, "from": from,
-                "text": text, "ts": client_ts, "outgoing": false, "color": null
-            }));
+        // An Olm message whose plaintext is a Megolm group-key share JSON.
+        "olm_group_key" => {
+            let plaintext = obtain_olm_plaintext(ctx, &inc.from, &inc.payload).await?;
+            handle_group_key_share(ctx, &inc.from, &plaintext)?;
         }
-
-        other => tracing::warn!("ignoring unknown msg_type {other:?} from {from}"),
+        // A Megolm group message.
+        "megolm" => {
+            let gid = inc
+                .group_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("megolm frame missing group_id"))?;
+            process_megolm(ctx, &inc.from, gid, &inc.payload, inc.client_ts)?;
+        }
+        other => tracing::warn!("ignoring unknown msg_type {other:?} from {}", inc.from),
     }
     Ok(())
 }
 
-/// Decode a base64 group key into the fixed 32-byte array the crypto API wants.
-pub fn group_key_from_b64(s: &str) -> Result<[u8; 32]> {
-    let bytes = cherm_crypto::b64_decode(s)?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("group key must be exactly 32 bytes"))
+/// Decrypt an Olm payload `"<olm_type>.<base64 body>"` from `from`, establishing
+/// an inbound session (and, if needed, fetching the peer's curve key) the first
+/// time. Re-persists the mutated session (and account on first contact).
+async fn obtain_olm_plaintext(ctx: &ProcCtx, from: &str, payload: &str) -> Result<Vec<u8>> {
+    let (olm_type, body) = parse_olm(payload)?;
+
+    // Existing session: decrypt + re-persist (the ratchet advanced).
+    if let Some(mut session) = vault::load_olm(&ctx.vault, &ctx.vault_key, from)? {
+        let plaintext = session.decrypt(olm_type, &body)?;
+        vault::save_olm(&ctx.vault, &ctx.vault_key, from, &session)?;
+        return Ok(plaintext);
+    }
+
+    // No session yet: we need the sender's curve25519 to accept the prekey msg.
+    let curve = match vault::get_contact_curve(&ctx.vault, from)? {
+        Some(c) => c,
+        None => {
+            // Fetch the bundle. Safe here: we're the processor, not the reader,
+            // so the reader still routes this reply to us — no deadlock.
+            match send_and_wait(&ctx.link, ClientMsg::FetchPrekeys { username: from.to_string() })
+                .await?
+            {
+                ServerMsg::PrekeyBundle {
+                    username,
+                    uuid,
+                    ed25519,
+                    curve25519,
+                    ..
+                } => {
+                    vault::upsert_contact(&ctx.vault, &username, &uuid, &ed25519, &curve25519)?;
+                    curve25519
+                }
+                ServerMsg::Error { code, message } => return Err(anyhow!("{code}: {message}")),
+                other => return Err(anyhow!("unexpected prekey reply: {other:?}")),
+            }
+        }
+    };
+
+    // Accept the inbound prekey message: consumes one of our one-time keys, so
+    // both the new session AND the mutated account must be persisted.
+    let mut device = vault::load_account(&ctx.vault, &ctx.vault_key)?
+        .ok_or_else(|| anyhow!("no device identity in vault"))?;
+    let (session, plaintext) = device.create_inbound(&curve, olm_type, &body)?;
+    vault::save_account(&ctx.vault, &ctx.vault_key, &device)?;
+    vault::save_olm(&ctx.vault, &ctx.vault_key, from, &session)?;
+    Ok(plaintext)
+}
+
+/// Materialize a DM chat for an incoming text and surface it.
+fn deliver_dm_text(ctx: &ProcCtx, from: &str, plaintext: &[u8], client_ts: i64) -> Result<()> {
+    let text = String::from_utf8(plaintext.to_vec())?;
+
+    let new_chat = !vault::chat_exists(&ctx.vault, from)?;
+    vault::upsert_chat(&ctx.vault, from, "dm", from)?;
+    vault::add_member(&ctx.vault, from, &ctx.me)?;
+    vault::add_member(&ctx.vault, from, from)?;
+    vault::insert_message(&ctx.vault, from, from, &text, client_ts, 0)?;
+
+    if new_chat {
+        ctx.events
+            .emit(vault::build_chats_event(&ctx.vault, &ctx.addr)?);
+    }
+    ctx.events.emit(json!({
+        "event": "message", "chat": from, "from": from,
+        "text": text, "ts": client_ts, "outgoing": false, "color": null
+    }));
+    if let Some(ed) = vault::get_contact_ed(&ctx.vault, from)? {
+        ctx.events.emit(json!({
+            "event": "fingerprint", "username": from,
+            "fingerprint": cherm_crypto::fingerprint_of(&ed)
+        }));
+    }
+    Ok(())
+}
+
+/// Accept a Megolm group-key share received over Olm: store the inbound session
+/// and materialize the group chat.
+fn handle_group_key_share(ctx: &ProcCtx, from: &str, plaintext: &[u8]) -> Result<()> {
+    let share: GroupKeyShare = serde_json::from_slice(plaintext)?;
+    let receiver = cherm_crypto::GroupReceiver::from_session_key_b64(&share.session_key)?;
+    vault::save_group_in(&ctx.vault, &ctx.vault_key, &share.group_id, from, &receiver)?;
+
+    vault::upsert_chat(&ctx.vault, &share.group_id, "group", &share.name)?;
+    for m in &share.members {
+        vault::add_member(&ctx.vault, &share.group_id, m)?;
+    }
+
+    ctx.events
+        .emit(vault::build_chats_event(&ctx.vault, &ctx.addr)?);
+    ctx.events
+        .emit(json!({"event": "info", "message": format!("added to group {}", share.name)}));
+    Ok(())
+}
+
+/// Decrypt a Megolm group message with the inbound session for `(group_id, from)`.
+fn process_megolm(
+    ctx: &ProcCtx,
+    from: &str,
+    group_id: &str,
+    payload: &str,
+    client_ts: i64,
+) -> Result<()> {
+    let mut receiver = match vault::load_group_in(&ctx.vault, &ctx.vault_key, group_id, from)? {
+        Some(r) => r,
+        None => {
+            // We have not received the key share yet; surface and keep going.
+            ctx.events.emit(json!({
+                "event": "error", "code": "decrypt_pending",
+                "message": format!("no inbound session for group {group_id} from {from} yet")
+            }));
+            return Ok(());
+        }
+    };
+
+    let body = cherm_crypto::b64_decode(payload)?;
+    let (plaintext, _idx) = receiver.decrypt(&body)?;
+    vault::save_group_in(&ctx.vault, &ctx.vault_key, group_id, from, &receiver)?;
+
+    let text = String::from_utf8(plaintext)?;
+    vault::insert_message(&ctx.vault, group_id, from, &text, client_ts, 0)?;
+    ctx.events.emit(json!({
+        "event": "message", "chat": group_id, "from": from,
+        "text": text, "ts": client_ts, "outgoing": false, "color": null
+    }));
+    Ok(())
+}
+
+/// Split an Olm payload `"<olm_type>.<base64 body>"` into `(olm_type, body)`.
+pub fn parse_olm(payload: &str) -> Result<(u8, Vec<u8>)> {
+    let (t_str, b_str) = payload
+        .split_once('.')
+        .ok_or_else(|| anyhow!("malformed olm payload (expected <type>.<b64>)"))?;
+    let olm_type: u8 = t_str
+        .parse()
+        .map_err(|_| anyhow!("invalid olm type prefix"))?;
+    let body = cherm_crypto::b64_decode(b_str)?;
+    Ok((olm_type, body))
+}
+
+/// Encode an Olm `(olm_type, body)` into the wire payload `"<type>.<b64>"`.
+pub fn encode_olm(olm_type: u8, body: &[u8]) -> String {
+    format!("{}.{}", olm_type, cherm_crypto::b64_encode(body))
 }

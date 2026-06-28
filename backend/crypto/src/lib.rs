@@ -1,20 +1,12 @@
-//! cherm.chat client-side cryptography.
+//! cherm.chat client cryptography — the message layer (Olm + Megolm via the
+//! audited [`vodozemac`] crate) plus at-rest vault-key derivation.
 //!
-//! All key material lives only on the client. The relay server never receives
-//! private keys and only ever forwards opaque ciphertext, so it cannot read
-//! message content (requirements 11 & 12).
+//! We do NOT hand-roll a ratchet. DMs use Olm (a Signal-derived Double Ratchet:
+//! forward secrecy + post-compromise security). Groups use Megolm (a sender-key
+//! ratchet: forward secrecy, one-encrypt-to-many), with the group key shared to
+//! each member over a pairwise Olm session. See PRIVACY.md.
 //!
-//! Primitives:
-//! - Identity & authentication: Ed25519 (an SSH-like keypair). The public key
-//!   is the immutable identity anchor that binds one username to one person
-//!   forever (requirements 6 & 7). Login is challenge-response: the server
-//!   sends a random nonce, the client returns an Ed25519 signature.
-//! - 1:1 encryption & key distribution: an anonymous "sealed box" — an
-//!   ephemeral X25519 ECDH to the recipient's static key, HKDF-SHA256 to a
-//!   symmetric key, then XChaCha20-Poly1305. Each message uses a fresh
-//!   ephemeral key, giving per-message key separation.
-//! - Group encryption: a random 32-byte group key shared once with each
-//!   member via a sealed box, then XChaCha20-Poly1305 for every group message.
+//! All key material lives only on the client; the relay sees opaque ciphertext.
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -22,239 +14,355 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey, StaticSecret};
+use vodozemac::megolm::{
+    GroupSession, GroupSessionPickle, InboundGroupSession, InboundGroupSessionPickle, MegolmMessage,
+    SessionConfig as MegolmConfig, SessionKey,
+};
+use vodozemac::olm::{
+    Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle,
+};
+use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 
-const HKDF_INFO: &[u8] = b"cherm-v1-seal";
-const EPH_LEN: usize = 32;
-const NONCE_LEN: usize = 24;
+const PICKLE_NONCE: usize = 24;
 
-/// A long-lived identity: an Ed25519 signing key plus an X25519 key for ECDH.
-pub struct Identity {
-    signing: SigningKey,
-    dh: StaticSecret,
+// ===========================================================================
+// Device identity (vodozemac Account)
+// ===========================================================================
+
+/// A per-(user, server) device identity: the Ed25519 + Curve25519 identity keys
+/// plus the one-time-key pool used to bootstrap Olm sessions.
+pub struct Device {
+    account: Account,
 }
 
-/// On-disk serialization of an [`Identity`]. Both secrets are 32 raw bytes,
-/// base64-encoded. Store this file with `0600` permissions.
-#[derive(Serialize, Deserialize)]
-struct IdentityFile {
-    /// base64 Ed25519 seed (32 bytes).
-    ed_seed: String,
-    /// base64 X25519 secret scalar (32 bytes).
-    dh_secret: String,
-}
-
-impl Identity {
-    /// Generate a fresh random identity.
+impl Device {
+    /// Create a fresh random identity.
     pub fn generate() -> Self {
-        let mut rng = OsRng;
-        let signing = SigningKey::generate(&mut rng);
-        let dh = StaticSecret::random_from_rng(&mut rng);
-        Identity { signing, dh }
+        Device {
+            account: Account::new(),
+        }
     }
 
-    /// Ed25519 public key (32 bytes) — the identity anchor.
-    pub fn ed_public(&self) -> [u8; 32] {
-        self.signing.verifying_key().to_bytes()
+    /// Base64 Ed25519 identity key — the immutable anchor + auth/signing key.
+    pub fn ed25519_b64(&self) -> String {
+        self.account.ed25519_key().to_base64()
     }
 
-    /// X25519 public key (32 bytes) — peers encrypt to this.
-    pub fn dh_public(&self) -> [u8; 32] {
-        XPublicKey::from(&self.dh).to_bytes()
+    /// Base64 Curve25519 identity key — used by peers to start Olm sessions.
+    pub fn curve25519_b64(&self) -> String {
+        self.account.curve25519_key().to_base64()
     }
 
-    /// Base64 of [`Identity::ed_public`].
-    pub fn ed_public_b64(&self) -> String {
-        B64.encode(self.ed_public())
+    /// A human-comparable safety-number fingerprint of the Ed25519 identity key
+    /// (groups of 5 digits), for out-of-band verification in the TUI.
+    pub fn fingerprint(&self) -> String {
+        fingerprint_of(&self.account.ed25519_key().to_base64())
     }
 
-    /// Base64 of [`Identity::dh_public`].
-    pub fn dh_public_b64(&self) -> String {
-        B64.encode(self.dh_public())
-    }
-
-    /// Sign a message with the Ed25519 key, returning a 64-byte signature.
-    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
-        self.signing.sign(msg).to_bytes()
-    }
-
-    /// Sign and base64-encode in one step (used for challenge responses).
+    /// Sign a server challenge nonce with the Ed25519 identity key.
     pub fn sign_b64(&self, msg: &[u8]) -> String {
-        B64.encode(self.sign(msg))
+        self.account.sign(msg).to_base64()
     }
 
-    /// Serialize to the on-disk JSON form.
-    pub fn to_json(&self) -> Result<String> {
-        let file = IdentityFile {
-            ed_seed: B64.encode(self.signing.to_bytes()),
-            dh_secret: B64.encode(self.dh.to_bytes()),
+    /// Generate `n` one-time keys and return them as `(key_id, curve25519_b64)`.
+    /// Call [`Device::mark_published`] once they have been uploaded.
+    pub fn generate_one_time_keys(&mut self, n: usize) -> Vec<(String, String)> {
+        self.account.generate_one_time_keys(n);
+        self.account
+            .one_time_keys()
+            .into_iter()
+            .map(|(id, key)| (id.to_base64(), key.to_base64()))
+            .collect()
+    }
+
+    /// Mark all currently-unpublished one-time keys as published.
+    pub fn mark_published(&mut self) {
+        self.account.mark_keys_as_published();
+    }
+
+    /// Start an OUTBOUND Olm session to a peer, given their published bundle.
+    pub fn start_session(&self, their_curve_b64: &str, their_otk_b64: &str) -> Result<OlmSession> {
+        let id = Curve25519PublicKey::from_base64(their_curve_b64).context("peer curve key")?;
+        let otk = Curve25519PublicKey::from_base64(their_otk_b64).context("peer one-time key")?;
+        let session = self
+            .account
+            .create_outbound_session(SessionConfig::version_1(), id, otk)
+            .map_err(|e| anyhow!("outbound session: {e}"))?;
+        Ok(OlmSession { session })
+    }
+
+    /// Accept an INBOUND Olm session from a peer's prekey message
+    /// (`olm_type == 0`). Returns the new session and the decrypted first message.
+    pub fn create_inbound(
+        &mut self,
+        their_curve_b64: &str,
+        olm_type: u8,
+        olm_body: &[u8],
+    ) -> Result<(OlmSession, Vec<u8>)> {
+        let id = Curve25519PublicKey::from_base64(their_curve_b64).context("peer curve key")?;
+        let msg = OlmMessage::from_parts(olm_type as usize, olm_body)
+            .map_err(|e| anyhow!("olm message: {e}"))?;
+        let pre = match msg {
+            OlmMessage::PreKey(pre) => pre,
+            OlmMessage::Normal(_) => {
+                return Err(anyhow!("expected a prekey message to start a session"))
+            }
         };
-        Ok(serde_json::to_string_pretty(&file)?)
+        let res = self
+            .account
+            .create_inbound_session(SessionConfig::version_1(), id, &pre)
+            .map_err(|e| anyhow!("inbound session: {e}"))?;
+        Ok((OlmSession { session: res.session }, res.plaintext))
     }
 
-    /// Parse from the on-disk JSON form.
-    pub fn from_json(s: &str) -> Result<Self> {
-        let file: IdentityFile = serde_json::from_str(s).context("parsing identity file")?;
-        let ed_seed = decode_array::<32>(&file.ed_seed).context("ed_seed")?;
-        let dh_secret = decode_array::<32>(&file.dh_secret).context("dh_secret")?;
-        Ok(Identity {
-            signing: SigningKey::from_bytes(&ed_seed),
-            dh: StaticSecret::from(dh_secret),
+    /// Encrypt this account to an at-rest pickle blob.
+    pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        encrypt_blob(key, &serde_json::to_vec(&self.account.pickle())?)
+    }
+
+    /// Restore an account from an at-rest pickle blob.
+    pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
+        let bytes = decrypt_blob(key, blob)?;
+        let pickle: AccountPickle = serde_json::from_slice(&bytes)?;
+        Ok(Device {
+            account: Account::from(pickle),
+        })
+    }
+}
+
+/// Compute a safety-number fingerprint from a base64 Ed25519 key.
+pub fn fingerprint_of(ed25519_b64: &str) -> String {
+    let digest = blake3::hash(ed25519_b64.as_bytes());
+    let bytes = digest.as_bytes();
+    // 30 decimal digits in groups of 5 (six groups) — easy to read aloud.
+    let mut digits = String::new();
+    for (i, b) in bytes.iter().take(15).enumerate() {
+        if i > 0 && i % 5 == 0 {
+            digits.push(' ');
+        }
+        digits.push_str(&format!("{:02}", (*b as u16 * 100 / 256)));
+    }
+    digits
+}
+
+// ===========================================================================
+// Olm 1:1 session
+// ===========================================================================
+
+/// A live Olm (Double Ratchet) session with one peer.
+pub struct OlmSession {
+    session: Session,
+}
+
+impl OlmSession {
+    /// Stable session id.
+    pub fn session_id(&self) -> String {
+        self.session.session_id()
+    }
+
+    /// Encrypt plaintext. Returns `(olm_type, body)` — `olm_type` is 0 for a
+    /// prekey message (until the peer replies) and 1 afterwards.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(u8, Vec<u8>)> {
+        let msg = self
+            .session
+            .encrypt(plaintext)
+            .map_err(|e| anyhow!("olm encrypt: {e}"))?;
+        let (t, body) = msg.to_parts();
+        Ok((t as u8, body))
+    }
+
+    /// Decrypt an Olm message produced by the peer.
+    pub fn decrypt(&mut self, olm_type: u8, body: &[u8]) -> Result<Vec<u8>> {
+        let msg = OlmMessage::from_parts(olm_type as usize, body)
+            .map_err(|e| anyhow!("olm message: {e}"))?;
+        self.session
+            .decrypt(&msg)
+            .map_err(|e| anyhow!("olm decrypt: {e}"))
+    }
+
+    pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+    }
+
+    pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
+        let bytes = decrypt_blob(key, blob)?;
+        let pickle: SessionPickle = serde_json::from_slice(&bytes)?;
+        Ok(OlmSession {
+            session: Session::from(pickle),
+        })
+    }
+}
+
+// ===========================================================================
+// Megolm group sessions
+// ===========================================================================
+
+/// An OUTBOUND Megolm session (what *we* send to a group with).
+pub struct GroupSender {
+    session: GroupSession,
+}
+
+impl GroupSender {
+    pub fn new() -> Self {
+        GroupSender {
+            session: GroupSession::new(MegolmConfig::version_1()),
+        }
+    }
+
+    pub fn session_id(&self) -> String {
+        self.session.session_id()
+    }
+
+    /// The shareable session key (base64) to seal to each member over Olm.
+    pub fn session_key_b64(&self) -> String {
+        self.session.session_key().to_base64()
+    }
+
+    /// The current ratchet index (rotation/forward-secrecy bookkeeping).
+    pub fn message_index(&self) -> u32 {
+        self.session.message_index()
+    }
+
+    /// Encrypt a group message (returns the Megolm message bytes).
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        self.session.encrypt(plaintext).to_bytes()
+    }
+
+    pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+    }
+
+    pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
+        let bytes = decrypt_blob(key, blob)?;
+        let pickle: GroupSessionPickle = serde_json::from_slice(&bytes)?;
+        Ok(GroupSender {
+            session: GroupSession::from(pickle),
+        })
+    }
+}
+
+impl Default for GroupSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// An INBOUND Megolm session (decrypts a particular sender's group messages).
+pub struct GroupReceiver {
+    session: InboundGroupSession,
+}
+
+impl GroupReceiver {
+    /// Build from a base64 session key received (over Olm) from the sender.
+    pub fn from_session_key_b64(session_key_b64: &str) -> Result<Self> {
+        let key = SessionKey::from_base64(session_key_b64).context("megolm session key")?;
+        Ok(GroupReceiver {
+            session: InboundGroupSession::new(&key, MegolmConfig::version_1()),
         })
     }
 
-    /// Decrypt a sealed box that was sealed to this identity's X25519 key.
-    pub fn unseal(&self, blob: &[u8]) -> Result<Vec<u8>> {
-        unseal(&self.dh, blob)
+    pub fn session_id(&self) -> String {
+        self.session.session_id()
+    }
+
+    /// Decrypt a Megolm message. Returns `(plaintext, message_index)`.
+    pub fn decrypt(&mut self, body: &[u8]) -> Result<(Vec<u8>, u32)> {
+        let msg = MegolmMessage::from_bytes(body).map_err(|e| anyhow!("megolm message: {e}"))?;
+        let out = self
+            .session
+            .decrypt(&msg)
+            .map_err(|e| anyhow!("megolm decrypt: {e}"))?;
+        Ok((out.plaintext, out.message_index))
+    }
+
+    pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+    }
+
+    pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
+        let bytes = decrypt_blob(key, blob)?;
+        let pickle: InboundGroupSessionPickle = serde_json::from_slice(&bytes)?;
+        Ok(GroupReceiver {
+            session: InboundGroupSession::from(pickle),
+        })
     }
 }
 
-/// Verify an Ed25519 signature given a raw 32-byte public key.
-pub fn verify(ed_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-    let Ok(vk) = VerifyingKey::from_bytes(ed_pub) else {
-        return false;
-    };
-    let signature = Signature::from_bytes(sig);
-    vk.verify(msg, &signature).is_ok()
+// ===========================================================================
+// Vault keys (per-server at-rest encryption)
+// ===========================================================================
+
+/// Generate a fresh 32-byte master key (stored at `~/.cherm/master.key`, 0600).
+pub fn gen_master_key() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    OsRng.fill_bytes(&mut k);
+    k
 }
 
-/// Verify using base64 inputs (convenience for the server).
-pub fn verify_b64(ed_pub_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
-    let (Ok(ed_pub), Ok(sig)) = (
-        decode_array::<32>(ed_pub_b64),
-        decode_array::<64>(sig_b64),
-    ) else {
-        return false;
-    };
-    verify(&ed_pub, msg, &sig)
+/// A stable server id (hex BLAKE3 of the server address) used as the vault
+/// directory name.
+pub fn server_id(addr: &str) -> String {
+    hex::encode(&blake3::hash(addr.as_bytes()).as_bytes()[..16])
 }
 
-/// Encrypt `plaintext` to a recipient's X25519 public key (sealed box).
-///
-/// Layout: `ephemeral_pub(32) || nonce(24) || ciphertext`.
-pub fn seal(recipient_dh_pub: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut rng = OsRng;
-    let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
-    let eph_pub = XPublicKey::from(&eph_secret);
-    let recipient = XPublicKey::from(*recipient_dh_pub);
-    let shared = eph_secret.diffie_hellman(&recipient);
-
-    let mut salt = Vec::with_capacity(64);
-    salt.extend_from_slice(eph_pub.as_bytes());
-    salt.extend_from_slice(recipient.as_bytes());
-    let key = hkdf_key(shared.as_bytes(), &salt)?;
-
-    let cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| anyhow!("cipher init: {e}"))?;
-    let mut nonce = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
-    let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
-        .map_err(|e| anyhow!("seal encrypt: {e}"))?;
-
-    let mut out = Vec::with_capacity(EPH_LEN + NONCE_LEN + ct.len());
-    out.extend_from_slice(eph_pub.as_bytes());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
-    Ok(out)
+/// Derive a per-server 32-byte vault key from the master key (keyed BLAKE3).
+pub fn derive_vault_key(master: &[u8; 32], server_id: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(master);
+    hasher.update(b"cherm-vault\0");
+    hasher.update(server_id.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
-/// Decrypt a sealed box with the recipient's X25519 static secret.
-pub fn unseal(my_dh: &StaticSecret, blob: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < EPH_LEN + NONCE_LEN {
-        return Err(anyhow!("sealed blob too short"));
-    }
-    let eph_pub: [u8; 32] = blob[..EPH_LEN].try_into().unwrap();
-    let nonce = &blob[EPH_LEN..EPH_LEN + NONCE_LEN];
-    let ct = &blob[EPH_LEN + NONCE_LEN..];
-
-    let eph = XPublicKey::from(eph_pub);
-    let shared = my_dh.diffie_hellman(&eph);
-    let me = XPublicKey::from(my_dh);
-
-    let mut salt = Vec::with_capacity(64);
-    salt.extend_from_slice(&eph_pub);
-    salt.extend_from_slice(me.as_bytes());
-    let key = hkdf_key(shared.as_bytes(), &salt)?;
-
-    let cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|e| anyhow!("cipher init: {e}"))?;
-    cipher
-        .decrypt(XNonce::from_slice(nonce), ct)
-        .map_err(|e| anyhow!("unseal decrypt (wrong key or tampered): {e}"))
+/// SQLCipher raw-key form (`x'<hex>'`) of a 32-byte vault key, for `PRAGMA key`.
+pub fn vault_key_sqlcipher(key: &[u8; 32]) -> String {
+    format!("x'{}'", hex::encode(key))
 }
 
-/// Sealed-box helpers that work with base64 strings directly.
-pub fn seal_b64(recipient_dh_pub_b64: &str, plaintext: &[u8]) -> Result<String> {
-    let pk = decode_array::<32>(recipient_dh_pub_b64).context("recipient dh_pub")?;
-    Ok(B64.encode(seal(&pk, plaintext)?))
-}
+// ===========================================================================
+// Pickle AEAD + base64 helpers
+// ===========================================================================
 
-/// Generate a random 32-byte symmetric group key.
-pub fn gen_group_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    key
-}
-
-/// Encrypt a group message. Layout: `nonce(24) || ciphertext`.
-pub fn group_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| anyhow!("cipher init: {e}"))?;
-    let mut nonce = [0u8; NONCE_LEN];
+fn encrypt_blob(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("cipher: {e}"))?;
+    let mut nonce = [0u8; PICKLE_NONCE];
     OsRng.fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(XNonce::from_slice(&nonce), plaintext)
-        .map_err(|e| anyhow!("group encrypt: {e}"))?;
-    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+        .map_err(|e| anyhow!("encrypt: {e}"))?;
+    let mut out = Vec::with_capacity(PICKLE_NONCE + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Decrypt a group message produced by [`group_encrypt`].
-pub fn group_decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < NONCE_LEN {
-        return Err(anyhow!("group blob too short"));
+fn decrypt_blob(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
+    if blob.len() < PICKLE_NONCE {
+        return Err(anyhow!("blob too short"));
     }
-    let nonce = &blob[..NONCE_LEN];
-    let ct = &blob[NONCE_LEN..];
-    let cipher = XChaCha20Poly1305::new_from_slice(key)
-        .map_err(|e| anyhow!("cipher init: {e}"))?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("cipher: {e}"))?;
     cipher
-        .decrypt(XNonce::from_slice(nonce), ct)
-        .map_err(|e| anyhow!("group decrypt (wrong key or tampered): {e}"))
+        .decrypt(XNonce::from_slice(&blob[..PICKLE_NONCE]), &blob[PICKLE_NONCE..])
+        .map_err(|e| anyhow!("decrypt (wrong key or tampered): {e}"))
 }
 
-/// Base64-encode helper.
+/// Verify a base64 Ed25519 signature against a base64 Ed25519 public key.
+pub fn verify_ed25519_b64(ed_pub_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
+    let (Ok(pk), Ok(sig)) = (
+        Ed25519PublicKey::from_base64(ed_pub_b64),
+        Ed25519Signature::from_base64(sig_b64),
+    ) else {
+        return false;
+    };
+    pk.verify(msg, &sig).is_ok()
+}
+
 pub fn b64_encode(data: &[u8]) -> String {
     B64.encode(data)
 }
 
-/// Base64-decode helper.
 pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(B64.decode(s)?)
-}
-
-fn hkdf_key(ikm: &[u8], salt: &[u8]) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut okm = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut okm)
-        .map_err(|_| anyhow!("hkdf expand"))?;
-    Ok(okm)
-}
-
-fn decode_array<const N: usize>(s: &str) -> Result<[u8; N]> {
-    let v = B64.decode(s)?;
-    let arr: [u8; N] = v
-        .try_into()
-        .map_err(|_| anyhow!("expected {N} bytes"))?;
-    Ok(arr)
 }
 
 #[cfg(test)]
@@ -262,44 +370,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_roundtrips_through_json() {
-        let id = Identity::generate();
-        let json = id.to_json().unwrap();
-        let id2 = Identity::from_json(&json).unwrap();
-        assert_eq!(id.ed_public(), id2.ed_public());
-        assert_eq!(id.dh_public(), id2.dh_public());
+    fn olm_dm_roundtrip() {
+        let alice = Device::generate();
+        let mut bob = Device::generate();
+        let otks = bob.generate_one_time_keys(1);
+        bob.mark_published();
+        let (_id, otk) = &otks[0];
+
+        let mut a = alice.start_session(&bob.curve25519_b64(), otk).unwrap();
+        let (t, body) = a.encrypt(b"hello bob").unwrap();
+        assert_eq!(t, 0); // prekey message
+
+        let (mut b, pt) = bob
+            .create_inbound(&alice.curve25519_b64(), t, &body)
+            .unwrap();
+        assert_eq!(pt, b"hello bob");
+
+        let (t2, body2) = b.encrypt(b"hi alice").unwrap();
+        assert_eq!(a.decrypt(t2, &body2).unwrap(), b"hi alice");
     }
 
     #[test]
-    fn sign_and_verify() {
-        let id = Identity::generate();
-        let msg = b"challenge-nonce";
-        let sig = id.sign(msg);
-        assert!(verify(&id.ed_public(), msg, &sig));
-        assert!(!verify(&id.ed_public(), b"other", &sig));
-        let other = Identity::generate();
-        assert!(!verify(&other.ed_public(), msg, &sig));
+    fn megolm_group_roundtrip() {
+        let mut sender = GroupSender::new();
+        let key = sender.session_key_b64();
+        let ct = sender.encrypt(b"hello group");
+        let mut receiver = GroupReceiver::from_session_key_b64(&key).unwrap();
+        let (pt, idx) = receiver.decrypt(&ct).unwrap();
+        assert_eq!(pt, b"hello group");
+        assert_eq!(idx, 0);
     }
 
     #[test]
-    fn seal_unseal_roundtrip() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let plaintext = b"hello bob, this is private";
-        let blob = seal(&bob.dh_public(), plaintext).unwrap();
-        let got = bob.unseal(&blob).unwrap();
-        assert_eq!(got, plaintext);
-        // Alice cannot decrypt a box sealed to Bob.
-        assert!(alice.unseal(&blob).is_err());
+    fn challenge_signature() {
+        let d = Device::generate();
+        let nonce = b"server-nonce";
+        let sig = d.sign_b64(nonce);
+        assert!(verify_ed25519_b64(&d.ed25519_b64(), nonce, &sig));
+        assert!(!verify_ed25519_b64(&d.ed25519_b64(), b"other", &sig));
     }
 
     #[test]
-    fn group_roundtrip() {
-        let key = gen_group_key();
-        let plaintext = b"hello everyone in the room";
-        let blob = group_encrypt(&key, plaintext).unwrap();
-        assert_eq!(group_decrypt(&key, &blob).unwrap(), plaintext);
-        let wrong = gen_group_key();
-        assert!(group_decrypt(&wrong, &blob).is_err());
+    fn account_pickle_roundtrip() {
+        let key = gen_master_key();
+        let mut d = Device::generate();
+        d.generate_one_time_keys(2);
+        let blob = d.to_pickle_encrypted(&key).unwrap();
+        let d2 = Device::from_pickle_encrypted(&key, &blob).unwrap();
+        assert_eq!(d.ed25519_b64(), d2.ed25519_b64());
+        // wrong key fails
+        let bad = gen_master_key();
+        assert!(Device::from_pickle_encrypted(&bad, &blob).is_err());
+    }
+
+    #[test]
+    fn vault_key_is_deterministic_and_separated() {
+        let m = gen_master_key();
+        let id1 = server_id("relay.a:9000");
+        let id2 = server_id("relay.b:9000");
+        assert_ne!(id1, id2);
+        assert_eq!(derive_vault_key(&m, &id1), derive_vault_key(&m, &id1));
+        assert_ne!(derive_vault_key(&m, &id1), derive_vault_key(&m, &id2));
+        assert!(vault_key_sqlcipher(&derive_vault_key(&m, &id1)).starts_with("x'"));
     }
 }

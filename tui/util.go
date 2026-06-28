@@ -54,6 +54,20 @@ func openBrowser(url string) error {
 	return exec.Command(name, args...).Start()
 }
 
+// hyperlink wraps text in an OSC 8 terminal hyperlink so capable terminals
+// (iTerm2, kitty, wezterm, modern gnome-terminal, …) make it genuinely
+// clickable. Terminals without OSC 8 support render the inner (already styled)
+// text unchanged, and the 'o' key remains a universal fallback. lipgloss
+// measures OSC 8 sequences as zero-width, so this does not perturb layout. An
+// empty url yields the plain text (no escape emitted).
+func hyperlink(url, text string) string {
+	if url == "" {
+		return text
+	}
+	// ESC ] 8 ; ; <url> BEL <text> ESC ] 8 ; ; BEL
+	return "\x1b]8;;" + url + "\x07" + text + "\x1b]8;;\x07"
+}
+
 // clampMin returns v, but never below lo.
 func clampMin(v, lo int) int {
 	if v < lo {

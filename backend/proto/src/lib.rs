@@ -33,6 +33,13 @@ pub fn valid_username(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// One published one-time prekey: an id and its base64 Curve25519 public key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneTimeKey {
+    pub key_id: String,
+    pub curve25519: String,
+}
+
 /// Messages sent from a client to the relay server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -41,10 +48,10 @@ pub enum ClientMsg {
     /// taken or this key is already registered under another name.
     Register {
         username: String,
-        /// base64 ed25519 public key (the identity / auth anchor).
-        ed_pub: String,
-        /// base64 x25519 public key (used by peers to encrypt to this user).
-        dh_pub: String,
+        /// base64 Ed25519 identity key (immutable anchor + auth/signing).
+        ed25519: String,
+        /// base64 Curve25519 identity key (peers start Olm sessions to this).
+        curve25519: String,
         /// Informational device fingerprint (e.g. hostname).
         machine_id: String,
     },
@@ -56,8 +63,13 @@ pub enum ClientMsg {
         /// base64 ed25519 signature over the challenge nonce.
         signature: String,
     },
-    /// Look up another user's public keys so we can encrypt to them.
-    Lookup { username: String },
+    /// Upload one-time prekeys so peers can start Olm sessions while we're offline.
+    PublishPrekeys { one_time_keys: Vec<OneTimeKey> },
+    /// Fetch a peer's prekey bundle (consumes one of their one-time keys).
+    FetchPrekeys { username: String },
+    /// Request a server attestation. Run before registering / authenticating so
+    /// the client can show a trust verdict first.
+    AttestRequest { nonce: String },
     /// Relay an end-to-end-encrypted message to one or more recipients.
     Send {
         /// Recipient usernames. For 1:1 this is a single name; for a group
@@ -87,13 +99,21 @@ pub enum ServerMsg {
     Challenge { nonce: String },
     /// Login (or registration) succeeded.
     AuthOk { uuid: String, username: String },
-    /// Result of a `Lookup`.
-    UserInfo {
+    /// Result of `FetchPrekeys`: a peer's identity keys plus (if available) one
+    /// consumed one-time key, enough to start an Olm session.
+    PrekeyBundle {
         username: String,
         uuid: String,
-        ed_pub: String,
-        dh_pub: String,
+        ed25519: String,
+        curve25519: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        one_time_key_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        one_time_key: Option<String>,
     },
+    /// Result of `AttestRequest`: the server attestation
+    /// (`cherm_attest::Attestation` serialized as JSON).
+    AttestResponse { attestation: serde_json::Value },
     /// A relayed end-to-end-encrypted message addressed to this client.
     Deliver {
         from: String,
@@ -122,6 +142,7 @@ pub mod errcode {
     pub const USERNAME_INVALID: &str = "username_invalid";
     pub const KEY_ALREADY_REGISTERED: &str = "key_already_registered";
     pub const UNKNOWN_USER: &str = "unknown_user";
+    pub const NO_PREKEYS: &str = "no_prekeys";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const NOT_AUTHENTICATED: &str = "not_authenticated";
     pub const BAD_REQUEST: &str = "bad_request";

@@ -7,30 +7,186 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// All rendering for the two screens lives here. The model owns state; this file
-// only turns that state into strings via lipgloss.
+// All rendering lives here. The model owns state; this file only turns that
+// state into strings via lipgloss. Message bubbles stay in render.go.
 
-// onboardView renders the centered username registration panel.
-func (m Model) onboardView() string {
+// center places a panel in the middle of the window, falling back to the panel
+// itself before the first WindowSizeMsg arrives.
+func (m Model) center(panel string) string {
+	if m.width <= 0 || m.height <= 0 {
+		return panel
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+// verdictBadge renders a tier/verdict pill: green tee, yellow software, red.
+func verdictBadge(verdict, tier string) string {
+	label := tier
+	if label == "" {
+		label = verdict
+	}
+	switch verdict {
+	case "green":
+		return badgeGreen.Render(label)
+	case "yellow":
+		return badgeYellow.Render(label)
+	default:
+		return badgeRed.Render(label)
+	}
+}
+
+// ---- servers home ----
+
+// serversView renders the list of known servers with verdict badges.
+func (m Model) serversView() string {
+	var b strings.Builder
+	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true))
+	b.WriteString("  " + menuKey.Render("servers") + "\n\n")
+	b.WriteString(menuLabel.Render("your servers"))
+	b.WriteString(footerStyle.Render("  (each keeps a separate encrypted vault)") + "\n\n")
+
+	if len(m.servers) == 0 {
+		b.WriteString(footerStyle.Render("no servers yet — press ") +
+			menuSel.Render("a") + footerStyle.Render(" to add one") + "\n")
+	}
+	for i, s := range m.servers {
+		cursor := "  "
+		addrStyle := menuLabel
+		if i == m.serverSel {
+			cursor = menuSel.Render("▸ ")
+			addrStyle = menuSel
+		}
+		who := s.Username
+		if who == "" {
+			who = "(no account)"
+		}
+		line := cursor + addrStyle.Render(s.Addr) + " " +
+			verdictBadge(s.Verdict, s.Tier) + "  " + footerStyle.Render(who)
+		if s.Active {
+			line += " " + badgeOn.Render("active")
+		}
+		b.WriteString(line + "\n")
+	}
+
+	b.WriteString("\n" + m.statusLine())
+	b.WriteString("\n" + footerStyle.Render("↑/↓ move · enter connect · a add server · esc chat · q quit"))
+
+	return m.center(panelStyle().Width(64).Render(b.String()))
+}
+
+// ---- add server ----
+
+// addServerView renders the host:port editor.
+func (m Model) addServerView() string {
+	var b strings.Builder
+	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true) + "\n\n")
+	b.WriteString(menuLabel.Render("add a server"))
+	b.WriteString(footerStyle.Render("  (it will be attested before you connect)") + "\n\n")
+	b.WriteString(menuKey.Render("host:port") + "\n")
+	b.WriteString(m.serverInput.View() + "\n")
+	if m.checking {
+		b.WriteString("\n" + statusStyle.Render("checking...") + "\n")
+	}
+	b.WriteString("\n" + footerStyle.Render("enter: check & attest   ·   esc: back"))
+
+	return m.center(panelStyle().Width(56).Render(b.String()))
+}
+
+// ---- verdict ----
+
+// verdictView renders the attestation verdict panel and the Cancel/Connect
+// buttons per ATTESTATION.md.
+func (m Model) verdictView() string {
+	v := m.verdict
+	var b strings.Builder
+	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true))
+	b.WriteString("  " + menuKey.Render("server attestation") + "\n\n")
+
+	b.WriteString(verdictBadge(v.verdict, v.tier) + "  " + menuLabel.Render(v.server) + "\n\n")
+
+	switch v.verdict {
+	case "green":
+		b.WriteString(greenText.Render("safe to connect") + "\n\n")
+	case "yellow":
+		b.WriteString(yellowText.Render("this server has only a software signature") + "\n")
+		b.WriteString(hyperlink(v.signaturesURL, linkStyle.Render("learn more ↗")) +
+			footerStyle.Render("  (press o or click)") + "\n\n")
+	default: // red
+		b.WriteString(redText.Render("this server does not match the official ") +
+			hyperlink(v.publicCodebaseURL, linkStyle.Render("public codebase")) +
+			redText.Render(" — it might be dangerous") + "\n")
+		b.WriteString(footerStyle.Render("press o or click to open the public codebase ↗") + "\n\n")
+	}
+
+	if v.tier != "" {
+		b.WriteString(infoRow("tier", v.tier))
+	}
+	if v.buildHash != "" {
+		b.WriteString(infoRow("build", truncate(v.buildHash, 44)))
+	}
+	if v.fingerprint != "" {
+		b.WriteString(infoRow("fingerprint", truncate(v.fingerprint, 44)))
+	}
+	if v.reason != "" {
+		b.WriteString(infoRow("reason", truncate(v.reason, 44)))
+	}
+	b.WriteString("\n")
+
+	connectLabel := "Connect"
+	connectDisabled := false
+	if v.verdict == "red" {
+		connectLabel = "Connect anyway"
+		if m.verdictCountdown > 0 {
+			connectDisabled = true
+			connectLabel = fmt.Sprintf("Connect anyway (%ds)", m.verdictCountdown)
+		}
+	}
+	b.WriteString(renderButtons(m.verdictSel, "Cancel", connectLabel, connectDisabled))
+	b.WriteString("\n\n" + footerStyle.Render("←/→ or tab: move · enter: select · o: open link · esc: cancel"))
+
+	return m.center(panelStyle().Width(66).Render(b.String()))
+}
+
+// renderButtons draws two side-by-side buttons; right may be disabled.
+func renderButtons(sel int, left, right string, rightDisabled bool) string {
+	render := func(label string, active, disabled bool) string {
+		st := lipgloss.NewStyle().Padding(0, 2).Border(lipgloss.RoundedBorder())
+		switch {
+		case disabled:
+			st = st.Foreground(cMuted).BorderForeground(cBorder)
+		case active:
+			st = st.Foreground(cDark).Background(cMagenta).BorderForeground(cMagenta).Bold(true)
+		default:
+			st = st.Foreground(cWhite).BorderForeground(cBorder)
+		}
+		return st.Render(label)
+	}
+	l := render(left, sel == 0, false)
+	r := render(right, sel == 1, rightDisabled)
+	return lipgloss.JoinHorizontal(lipgloss.Top, l, "  ", r)
+}
+
+// ---- username registration ----
+
+// usernameView renders the centered username registration panel for a server.
+func (m Model) usernameView() string {
 	var b strings.Builder
 	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true))
 	b.WriteString("\n\n")
 	b.WriteString(menuLabel.Render("end-to-end-encrypted terminal chat") + "\n")
-	b.WriteString(footerStyle.Render("server: "+m.serverAddr) + "\n\n")
+	b.WriteString(footerStyle.Render("server: "+m.pendingServer) + "\n\n")
 	b.WriteString(menuLabel.Render("choose a username") + footerStyle.Render("  (1-16, letters & digits)") + "\n\n")
 	b.WriteString(m.nameInput.View())
 	b.WriteString("\n")
 	if m.onboardErr != "" {
 		b.WriteString("\n" + errStyle.Render(m.onboardErr))
 	}
-	b.WriteString("\n\n" + footerStyle.Render("enter: register   ctrl+c: quit"))
+	b.WriteString("\n\n" + footerStyle.Render("enter: register   esc: back   ctrl+c: quit"))
 
-	panel := panelStyle().Render(b.String())
-	if m.width <= 0 || m.height <= 0 {
-		return panel
-	}
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+	return m.center(panelStyle().Render(b.String()))
 }
+
+// ---- chat ----
 
 // chatView renders the header + sidebar + message pane + input + footer layout.
 func (m Model) chatView() string {
@@ -42,8 +198,8 @@ func (m Model) chatView() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.footerView())
 }
 
-// headerView is the slim top bar: gradient logo on the left, connection badge +
-// server + a menu hint on the right.
+// headerView is the slim top bar: gradient logo on the left, an optional safety
+// number for the open DM, connection badge + user@server + a menu hint.
 func (m Model) headerView() string {
 	logo := gradientText("✦ cherm.chat", hexMagenta, hexPink, true)
 
@@ -51,7 +207,15 @@ func (m Model) headerView() string {
 	if m.connected {
 		badge = badgeOn.Render("online")
 	}
-	right := badge + footerStyle.Render(" "+m.serverAddr+"  esc: menu")
+	who := m.username
+	if who == "" {
+		who = "-"
+	}
+	info := ""
+	if fp := m.currentFingerprint(); fp != "" {
+		info = footerStyle.Render("🔒 " + truncate(fp, 16) + "  ")
+	}
+	right := info + badge + footerStyle.Render(" "+who+" @ "+m.serverAddr+"  esc: menu")
 
 	if m.width <= 0 {
 		return logo + "   " + right
@@ -144,7 +308,7 @@ func (m Model) footerView() string {
 		line1 = footerStyle.Render(left+"  |  ") + style.Render(status)
 	}
 
-	hint := "/dm  /group  /menu  /help  /quit  ·  tab: focus  ·  esc: menu  ·  enter: open/send"
+	hint := "/dm  /group  /servers  /menu  /help  /quit  ·  tab: focus  ·  esc: menu  ·  enter: open/send"
 	line2 := footerStyle.Render(hint)
 
 	out := lipgloss.JoinVertical(lipgloss.Left, line1, line2)
@@ -154,8 +318,21 @@ func (m Model) footerView() string {
 	return out
 }
 
+// statusLine renders the transient status as a standalone line (panel screens).
+func (m Model) statusLine() string {
+	if m.status == "" {
+		return ""
+	}
+	if m.isError {
+		return errStyle.Render(m.status)
+	}
+	return statusStyle.Render(m.status)
+}
+
+// ---- menu ----
+
 // menuView renders the centered menu panel: server/ping/identity info, an
-// actions list (or the server-address editor), and key hints.
+// actions list, and key hints.
 func (m Model) menuView() string {
 	var b strings.Builder
 	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true))
@@ -182,33 +359,25 @@ func (m Model) menuView() string {
 	}
 	b.WriteString("\n")
 
-	if m.menuEditing {
-		b.WriteString(menuLabel.Render("new server address:") + "\n\n")
-		b.WriteString(m.serverInput.View() + "\n\n")
-		b.WriteString(footerStyle.Render("enter: connect   ·   esc: cancel"))
-	} else {
-		items := []string{"Change server", "Refresh ping", "Help", "Open docs ↗", "Back to chat"}
-		for i, it := range items {
-			if i == m.menuSel {
-				b.WriteString(menuSel.Render("▸ "+it) + "\n")
-			} else {
-				b.WriteString("  " + menuLabel.Render(it) + "\n")
-			}
+	items := []string{"Change server", "Refresh ping", "Help", "Open docs ↗", "Back to chat"}
+	for i, it := range items {
+		if i == m.menuSel {
+			b.WriteString(menuSel.Render("▸ "+it) + "\n")
+		} else {
+			b.WriteString("  " + menuLabel.Render(it) + "\n")
 		}
-		b.WriteString("\n" + footerStyle.Render("↑/↓ move · enter select · r ping · esc back"))
 	}
+	b.WriteString("\n" + footerStyle.Render("↑/↓ move · enter select · r ping · esc back"))
 
-	panel := panelStyle().Width(56).Render(b.String())
-	if m.width <= 0 || m.height <= 0 {
-		return panel
-	}
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+	return m.center(panelStyle().Width(56).Render(b.String()))
 }
 
-// infoRow formats a fixed-width key + value line for the menu.
+// infoRow formats a fixed-width key + value line for the menu / verdict panels.
 func infoRow(key, value string) string {
-	return menuKey.Render(fmt.Sprintf("%-9s", key)) + menuLabel.Render(value) + "\n"
+	return menuKey.Render(fmt.Sprintf("%-11s", key)) + menuLabel.Render(value) + "\n"
 }
+
+// ---- help ----
 
 // helpView renders the centered command + key reference.
 func (m Model) helpView() string {
@@ -219,6 +388,7 @@ func (m Model) helpView() string {
 	b.WriteString(titleStyle.Render("commands") + "\n")
 	b.WriteString(helpRow("/dm <user>", "start or open a 1:1 chat"))
 	b.WriteString(helpRow("/group <name> <u...>", "create a group"))
+	b.WriteString(helpRow("/servers", "switch / add a server"))
 	b.WriteString(helpRow("/menu", "server, ping, docs"))
 	b.WriteString(helpRow("/help", "show this help"))
 	b.WriteString(helpRow("/quit", "exit"))
@@ -233,11 +403,7 @@ func (m Model) helpView() string {
 	b.WriteString(helpRow("ctrl+c", "quit"))
 	b.WriteString("\n" + footerStyle.Render("press esc or enter to go back"))
 
-	panel := panelStyle().Width(60).Render(b.String())
-	if m.width <= 0 || m.height <= 0 {
-		return panel
-	}
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+	return m.center(panelStyle().Width(60).Render(b.String()))
 }
 
 // helpRow formats a fixed-width command/key + description line.

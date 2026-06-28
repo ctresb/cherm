@@ -22,6 +22,28 @@ func TestSnapshot(t *testing.T) {
 	for name, s := range map[string]screen{"chat": screenChat, "menu": screenMenu, "help": screenHelp} {
 		_ = os.WriteFile(dir+"/"+name+".ansi", []byte(renderModel(s).View()), 0o644)
 	}
+	// servers home
+	sv := renderModel(screenServers)
+	sv.servers = []ServerInfo{
+		{Addr: "chat.cherm.example:9000", Tier: "tee", Verdict: "green", Username: "alice", Active: true},
+		{Addr: "relay.example:9000", Tier: "software", Verdict: "yellow", Username: ""},
+		{Addr: "sketchy.example:9000", Tier: "unsigned", Verdict: "red", Username: ""},
+	}
+	_ = os.WriteFile(dir+"/servers.ansi", []byte(sv.View()), 0o644)
+	// the three verdict screens
+	verdicts := map[string]attestMsg{
+		"verdict_green":  {server: "chat.cherm.example:9000", verdict: "green", tier: "tee", buildHash: "abc123def456", fingerprint: "AA BB CC DD"},
+		"verdict_yellow": {server: "relay.example:9000", verdict: "yellow", tier: "software", buildHash: "abc123def456", signaturesURL: "https://cherm.chat/signatures"},
+		"verdict_red":    {server: "sketchy.example:9000", verdict: "red", tier: "unsigned", reason: "server provided no signature", publicCodebaseURL: "https://github.com/cherm-chat/cherm"},
+	}
+	for name, v := range verdicts {
+		vm := renderModel(screenVerdict)
+		vm.verdict = v
+		if v.verdict == "red" {
+			vm.verdictCountdown = 7
+		}
+		_ = os.WriteFile(dir+"/"+name+".ansi", []byte(vm.View()), 0o644)
+	}
 }
 
 var ansiRE = regexp.MustCompile("\x1b\\[[0-9;?]*[a-zA-Z]")
@@ -87,6 +109,80 @@ func TestRenderScreensAndPalette(t *testing.T) {
 	for _, want := range []string{"/dm", "/group", "/menu", "ctrl+c", "switch chat list"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help view missing %q", want)
+		}
+	}
+}
+
+// TestRenderServerScreens exercises the v2 multi-server + attestation screens.
+func TestRenderServerScreens(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(termenv.ANSI)
+
+	// servers home: addr + verdict badge + active marker.
+	m := renderModel(screenServers)
+	m.servers = []ServerInfo{
+		{Addr: "chat.cherm.example:9000", Tier: "tee", Verdict: "green", Username: "alice", Active: true},
+		{Addr: "relay.example:9000", Tier: "software", Verdict: "yellow", Username: ""},
+	}
+	servers := strip(m.View())
+	for _, want := range []string{"servers", "chat.cherm.example:9000", "tee", "relay.example:9000", "software", "(no account)", "active", "add server"} {
+		if !strings.Contains(servers, want) {
+			t.Errorf("servers view missing %q", want)
+		}
+	}
+
+	// add-server: prompt + checking indicator.
+	a := renderModel(screenAddServer)
+	a.checking = true
+	add := strip(a.View())
+	for _, want := range []string{"add a server", "host:port", "checking..."} {
+		if !strings.Contains(add, want) {
+			t.Errorf("add-server view missing %q", want)
+		}
+	}
+
+	// red verdict: dangerous wording, "public codebase" highlight, disabled
+	// "Connect anyway" with a live countdown.
+	r := renderModel(screenVerdict)
+	r.verdict = attestMsg{server: "evil:9000", verdict: "red", tier: "unsigned", buildHash: "deadbeef", publicCodebaseURL: "https://github.com/cherm-chat/cherm"}
+	r.verdictCountdown = 7
+	r.verdictSel = 0
+	red := strip(r.View())
+	for _, want := range []string{"does not match", "public codebase", "Cancel", "Connect anyway", "7s"} {
+		if !strings.Contains(red, want) {
+			t.Errorf("red verdict view missing %q", want)
+		}
+	}
+
+	// yellow verdict: software-signature wording + learn more.
+	y := renderModel(screenVerdict)
+	y.verdict = attestMsg{server: "relay:9000", verdict: "yellow", tier: "software", signaturesURL: "https://cherm.chat/signatures"}
+	y.verdictCountdown = 0
+	y.verdictSel = 1
+	yellow := strip(y.View())
+	for _, want := range []string{"software signature", "learn more", "Connect"} {
+		if !strings.Contains(yellow, want) {
+			t.Errorf("yellow verdict view missing %q", want)
+		}
+	}
+
+	// green verdict: safe-to-connect + details.
+	g := renderModel(screenVerdict)
+	g.verdict = attestMsg{server: "chat:9000", verdict: "green", tier: "tee", buildHash: "abc123", fingerprint: "AA BB CC"}
+	green := strip(g.View())
+	for _, want := range []string{"safe to connect", "tee", "Connect", "Cancel"} {
+		if !strings.Contains(green, want) {
+			t.Errorf("green verdict view missing %q", want)
+		}
+	}
+
+	// username screen.
+	u := renderModel(screenUsername)
+	u.pendingServer = "chat:9000"
+	user := strip(u.View())
+	for _, want := range []string{"choose a username", "chat:9000"} {
+		if !strings.Contains(user, want) {
+			t.Errorf("username view missing %q", want)
 		}
 	}
 }

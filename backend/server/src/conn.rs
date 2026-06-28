@@ -3,14 +3,14 @@
 //! THE CORE INVARIANT — "the relay cannot read messages":
 //! Everything in this module operates on opaque, already-encrypted bytes. When
 //! a client sends a `Send`, its `payload` is base64 ciphertext produced on the
-//! client with keys the server never possesses (sealed box / group AEAD, see
+//! client with keys the server never possesses (Olm / Megolm, see
 //! `cherm_crypto`). This module only ever:
 //!   * routes that ciphertext to the named recipients (online -> push, offline
-//!     -> outbox), copying `payload` verbatim into a `Deliver` frame, and
+//!     -> outbox), copying `payload` verbatim into a `Deliver` frame,
+//!   * stores/hands out PUBLIC prekeys and PUBLIC directory records, and
 //!   * verifies *signatures* over a random nonce for authentication.
 //! It never decrypts, re-encrypts, or inspects `payload`. The relay therefore
-//! learns routing metadata (who talks to whom, and when) but never content
-//! (requirements 11 & 12).
+//! learns routing metadata (who talks to whom, and when) but never content.
 //!
 //! Concurrency model for one TCP connection:
 //!   * The stream is split (`tokio::io::split`) into a read half and a write
@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 
 use cherm_proto::{errcode, read_msg, valid_username, write_msg, ClientMsg, ServerMsg};
 
+use crate::attest;
 use crate::db;
 
 /// Map of currently-online username -> a channel to that connection's writer
@@ -76,18 +77,18 @@ enum RegErr {
 fn register_user(
     conn: &Connection,
     username: &str,
-    ed_pub: &str,
-    dh_pub: &str,
+    ed25519: &str,
+    curve25519: &str,
     machine_id: &str,
 ) -> Result<String, RegErr> {
     if db::username_exists(conn, username).map_err(RegErr::Db)? {
         return Err(RegErr::Taken);
     }
-    if db::key_exists(conn, ed_pub).map_err(RegErr::Db)? {
+    if db::key_exists(conn, ed25519).map_err(RegErr::Db)? {
         return Err(RegErr::KeyExists);
     }
     let uuid = uuid::Uuid::new_v4().to_string();
-    db::insert_user(conn, &uuid, username, ed_pub, dh_pub, machine_id, now_millis())
+    db::insert_user(conn, &uuid, username, ed25519, curve25519, machine_id, now_millis())
         .map_err(RegErr::Db)?;
     Ok(uuid)
 }
@@ -168,7 +169,13 @@ fn flush_outbox(db: &Db, tx: &mpsc::UnboundedSender<ServerMsg>, username: &str) 
 }
 
 /// Handle one accepted TCP connection from start to finish.
-pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Online, db: Db) {
+pub async fn handle(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    online: Online,
+    db: Db,
+    attestor: attest::Shared,
+) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // The single outbound channel for this connection (see module docs).
@@ -213,11 +220,26 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
         };
 
         match msg {
+            // ---- Attestation: prove what code we run (runs pre-auth) --------
+            ClientMsg::AttestRequest { nonce } => {
+                let att = attestor.build(&nonce, now_millis());
+                match serde_json::to_value(&att) {
+                    Ok(attestation) => {
+                        let _ = tx.send(ServerMsg::AttestResponse { attestation });
+                        debug!(%peer, "served attestation");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to serialize attestation");
+                        let _ = tx.send(err(errcode::INTERNAL, "internal server error"));
+                    }
+                }
+            }
+
             // ---- Registration: create a brand-new immutable identity --------
             ClientMsg::Register {
                 username,
-                ed_pub,
-                dh_pub,
+                ed25519,
+                curve25519,
                 machine_id,
             } => {
                 if !valid_username(&username) {
@@ -229,7 +251,7 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
                 }
                 let result = {
                     let conn = db.lock().unwrap();
-                    register_user(&conn, &username, &ed_pub, &dh_pub, &machine_id)
+                    register_user(&conn, &username, &ed25519, &curve25519, &machine_id)
                 };
                 match result {
                     Ok(uuid) => {
@@ -293,7 +315,7 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
                     Ok(Some(rec)) => {
                         // The signature is over the RAW decoded nonce bytes,
                         // verified against the stored Ed25519 public key.
-                        if cherm_crypto::verify_b64(&rec.ed_pub, &nonce, &signature) {
+                        if cherm_crypto::verify_ed25519_b64(&rec.ed25519, &nonce, &signature) {
                             authed = Some(username.clone());
                             online.lock().await.insert(username.clone(), tx.clone());
                             let _ = tx.send(ServerMsg::AuthOk {
@@ -318,26 +340,77 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
                 }
             }
 
-            // ---- Directory lookup: return a peer's PUBLIC keys -------------
-            ClientMsg::Lookup { username } => {
-                let record = {
-                    let conn = db.lock().unwrap();
-                    db::lookup_user(&conn, &username)
+            // ---- Publish one-time prekeys (requires auth) ------------------
+            ClientMsg::PublishPrekeys { one_time_keys } => {
+                let user = match &authed {
+                    Some(u) => u.clone(),
+                    None => {
+                        let _ = tx
+                            .send(err(errcode::NOT_AUTHENTICATED, "register or log in first"));
+                        continue;
+                    }
                 };
-                match record {
-                    Ok(Some(rec)) => {
-                        let _ = tx.send(ServerMsg::UserInfo {
+                let result = {
+                    let conn = db.lock().unwrap();
+                    let mut res = Ok(());
+                    for k in &one_time_keys {
+                        if let Err(e) = db::insert_prekey(&conn, &user, &k.key_id, &k.curve25519) {
+                            res = Err(e);
+                            break;
+                        }
+                    }
+                    res
+                };
+                match result {
+                    Ok(()) => {
+                        debug!(user = %user, count = one_time_keys.len(), "published prekeys");
+                        let _ = tx.send(ServerMsg::Ok { detail: None });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "database error during PublishPrekeys");
+                        let _ = tx.send(err(errcode::INTERNAL, "internal server error"));
+                    }
+                }
+            }
+
+            // ---- Fetch a peer's prekey bundle (consumes one OTK) ----------
+            ClientMsg::FetchPrekeys { username } => {
+                // A fetch CONSUMES one of the target's one-time keys, so it is a
+                // state-mutating, resource-consuming operation and must require
+                // auth — exactly like PublishPrekeys / Send / Pull. Without this
+                // gate an anonymous peer could repeatedly drain any user's OTK
+                // pool (a DoS that also forces peers into the no-OTK fallback,
+                // weakening session-bootstrap forward secrecy). The documented
+                // DM-setup sequence always fetches after AuthOk, so this never
+                // breaks a legitimate client.
+                if authed.is_none() {
+                    let _ = tx.send(err(errcode::NOT_AUTHENTICATED, "register or log in first"));
+                    continue;
+                }
+                let outcome = {
+                    let conn = db.lock().unwrap();
+                    db::fetch_bundle(&conn, &username)
+                };
+                match outcome {
+                    Ok(Some((rec, otk))) => {
+                        let (one_time_key_id, one_time_key) = match otk {
+                            Some((id, key)) => (Some(id), Some(key)),
+                            None => (None, None),
+                        };
+                        let _ = tx.send(ServerMsg::PrekeyBundle {
                             username: rec.username,
                             uuid: rec.uuid,
-                            ed_pub: rec.ed_pub,
-                            dh_pub: rec.dh_pub,
+                            ed25519: rec.ed25519,
+                            curve25519: rec.curve25519,
+                            one_time_key_id,
+                            one_time_key,
                         });
                     }
                     Ok(None) => {
                         let _ = tx.send(err(errcode::UNKNOWN_USER, "no such user"));
                     }
                     Err(e) => {
-                        error!(error = %e, "database error during Lookup");
+                        error!(error = %e, "database error during FetchPrekeys");
                         let _ = tx.send(err(errcode::INTERNAL, "internal server error"));
                     }
                 }
@@ -364,8 +437,8 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
                     // Never echo a message back to its sender. For a group the
                     // `to` list is every member, which includes the author; the
                     // author already has the plaintext locally, so delivering it
-                    // back would duplicate it (group_msg goes to members EXCEPT
-                    // self). Harmless for 1:1 where `to` is just the peer.
+                    // back would duplicate it. Harmless for 1:1 where `to` is
+                    // just the peer.
                     if recipient == &from {
                         continue;
                     }
@@ -427,7 +500,11 @@ pub async fn handle(stream: TcpStream, peer: std::net::SocketAddr, online: Onlin
         // here would wrongly mark the live connection offline and silently route
         // its messages to the outbox. Compare channel identity before removing.
         let mut guard = online.lock().await;
-        if guard.get(&u).map(|existing| existing.same_channel(&tx)).unwrap_or(false) {
+        if guard
+            .get(&u)
+            .map(|existing| existing.same_channel(&tx))
+            .unwrap_or(false)
+        {
             guard.remove(&u);
         }
         drop(guard);

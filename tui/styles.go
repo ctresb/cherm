@@ -30,6 +30,13 @@ var (
 	cBorder = lipgloss.Color("#3A2E3F")
 	cMuted  = lipgloss.Color("#8A8D93")
 
+	// verdict colors (attestation traffic-light: green tee / yellow software /
+	// red). Semantic only — they dress the attestation UI and never the chat
+	// bubbles, which stay white per PROTOCOL.md section 6.
+	cGreen  = lipgloss.Color("#2ECC71")
+	cYellow = lipgloss.Color("#F1C40F")
+	cRed    = lipgloss.Color("#E74C3C")
+
 	// colorAccent is the primary accent (focused borders, selections).
 	colorAccent = cMagenta
 
@@ -52,6 +59,18 @@ var (
 	menuKey   = lipgloss.NewStyle().Foreground(cMuted)
 	menuLabel = lipgloss.NewStyle().Foreground(cWhite)
 	menuSel   = lipgloss.NewStyle().Foreground(cPink).Bold(true)
+
+	// attestation verdict badges + body text.
+	badgeGreen  = lipgloss.NewStyle().Foreground(cDark).Background(cGreen).Bold(true).Padding(0, 1)
+	badgeYellow = lipgloss.NewStyle().Foreground(cDark).Background(cYellow).Bold(true).Padding(0, 1)
+	badgeRed    = lipgloss.NewStyle().Foreground(cWhite).Background(cRed).Bold(true).Padding(0, 1)
+	greenText   = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+	yellowText  = lipgloss.NewStyle().Foreground(cYellow).Bold(true)
+	redText     = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+
+	// linkStyle highlights a clickable URL (the yellow "learn more" and the red
+	// "public codebase").
+	linkStyle = lipgloss.NewStyle().Foreground(cMagenta).Underline(true).Bold(true)
 )
 
 // boxStyle returns a rounded-border box whose border color reflects focus.

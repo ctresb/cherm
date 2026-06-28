@@ -1,0 +1,1 @@
+◜ ◝ ◞ ◟ <- this one is fire, can be like a spinning thing.

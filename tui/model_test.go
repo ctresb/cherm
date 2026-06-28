@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 func TestValidUsername(t *testing.T) {
 	good := []string{"alice", "Bob123", "a", "0123456789abcdef"}
@@ -18,14 +22,18 @@ func TestValidUsername(t *testing.T) {
 }
 
 func TestParseEvent(t *testing.T) {
+	// Events whose typed messages are comparable (no slices).
 	cases := map[string]any{
-		`{"event":"ready","registered":true,"username":"alice"}`:                          readyMsg{registered: true, username: "alice"},
-		`{"event":"registered","username":"alice","uuid":"u1"}`:                           registeredMsg{username: "alice", uuid: "u1"},
-		`{"event":"connected","username":"alice","uuid":"u1"}`:                            connectedMsg{username: "alice", uuid: "u1"},
-		`{"event":"disconnected","reason":"bye"}`:                                         disconnectedMsg{reason: "bye"},
-		`{"event":"message","chat":"bob","from":"bob","text":"hi","ts":123,"color":null}`: messageMsg{chat: "bob", from: "bob", text: "hi", ts: 123},
-		`{"event":"error","message":"boom","code":"x"}`:                                   errorMsg{message: "boom", code: "x"},
-		`{"event":"info","message":"hello"}`:                                              infoMsg{message: "hello"},
+		`{"event":"registered","server":"s:1","username":"alice","uuid":"u1"}`:                                                                  registeredMsg{server: "s:1", username: "alice", uuid: "u1"},
+		`{"event":"connected","server":"s:1","username":"alice","active":true}`:                                                                 connectedMsg{server: "s:1", username: "alice", active: true},
+		`{"event":"disconnected","server":"s:1","reason":"bye"}`:                                                                                disconnectedMsg{server: "s:1", reason: "bye"},
+		`{"event":"need_username","server":"s:1"}`:                                                                                              needUsernameMsg{server: "s:1"},
+		`{"event":"message","chat":"bob","from":"bob","text":"hi","ts":123,"color":null}`:                                                       messageMsg{chat: "bob", from: "bob", text: "hi", ts: 123},
+		`{"event":"fingerprint","username":"bob","fingerprint":"AB CD EF"}`:                                                                     fingerprintMsg{username: "bob", fingerprint: "AB CD EF"},
+		`{"event":"error","message":"boom","code":"x"}`:                                                                                         errorMsg{message: "boom", code: "x"},
+		`{"event":"info","message":"hello"}`:                                                                                                    infoMsg{message: "hello"},
+		`{"event":"pong","rtt_ms":12,"server":"s:1"}`:                                                                                           pongMsg{rttMs: 12, server: "s:1"},
+		`{"event":"attest","server":"s:1","verdict":"red","tier":"unsigned","public_codebase_url":"https://gh","signatures_url":"https://sig"}`: attestMsg{server: "s:1", verdict: "red", tier: "unsigned", publicCodebaseURL: "https://gh", signaturesURL: "https://sig"},
 	}
 	for line, want := range cases {
 		got := parseEvent([]byte(line))
@@ -34,8 +42,14 @@ func TestParseEvent(t *testing.T) {
 		}
 	}
 
-	// chats / history carry slices, compare key bits.
-	if m, ok := parseEvent([]byte(`{"event":"chats","chats":[{"id":"bob","kind":"dm","title":"bob","last_ts":9}]}`)).(chatsMsg); !ok || len(m.chats) != 1 || m.chats[0].ID != "bob" {
+	// ready / servers / chats / history carry slices: compare key bits.
+	if m, ok := parseEvent([]byte(`{"event":"ready","has_master":true,"servers":[{"id":"i","addr":"s:1","tier":"tee","verdict":"green","active":true}]}`)).(readyMsg); !ok || !m.hasMaster || len(m.servers) != 1 || m.servers[0].Addr != "s:1" || m.servers[0].Verdict != "green" {
+		t.Errorf("ready parse failed: %#v", m)
+	}
+	if m, ok := parseEvent([]byte(`{"event":"servers","servers":[{"addr":"s:1","tier":"software","verdict":"yellow","username":"alice"}]}`)).(serversMsg); !ok || len(m.servers) != 1 || m.servers[0].Username != "alice" {
+		t.Errorf("servers parse failed: %#v", m)
+	}
+	if m, ok := parseEvent([]byte(`{"event":"chats","server":"s:1","chats":[{"id":"bob","kind":"dm","title":"bob","last_ts":9}]}`)).(chatsMsg); !ok || m.server != "s:1" || len(m.chats) != 1 || m.chats[0].ID != "bob" {
 		t.Errorf("chats parse failed: %#v", m)
 	}
 	if m, ok := parseEvent([]byte(`{"event":"history","chat":"bob","messages":[{"from":"bob","text":"hi","ts":1,"outgoing":false}]}`)).(historyMsg); !ok || m.chat != "bob" || len(m.messages) != 1 {
@@ -48,23 +62,111 @@ func TestParseEvent(t *testing.T) {
 }
 
 func TestReadyFlow(t *testing.T) {
-	// Unregistered -> onboarding screen.
+	// No known servers -> add-server screen.
 	m := NewModel(&Core{})
-	out, _ := m.Update(readyMsg{registered: false})
+	out, _ := m.Update(readyMsg{servers: nil, hasMaster: false})
 	mm := out.(Model)
-	if mm.screen != screenOnboard {
-		t.Fatalf("expected onboarding screen, got %v", mm.screen)
+	if mm.screen != screenAddServer {
+		t.Fatalf("expected add-server screen, got %v", mm.screen)
 	}
 
-	// Registered -> chat screen.
+	// Known servers -> servers home screen.
 	m2 := NewModel(&Core{})
-	out2, _ := m2.Update(readyMsg{registered: true, username: "alice"})
+	out2, _ := m2.Update(readyMsg{
+		servers:   []ServerInfo{{Addr: "chat:9000", Tier: "tee", Verdict: "green", Username: "alice", Active: true}},
+		hasMaster: true,
+	})
 	mm2 := out2.(Model)
-	if mm2.screen != screenChat {
-		t.Fatalf("expected chat screen, got %v", mm2.screen)
+	if mm2.screen != screenServers {
+		t.Fatalf("expected servers screen, got %v", mm2.screen)
 	}
-	if mm2.username != "alice" {
-		t.Fatalf("expected username alice, got %q", mm2.username)
+	if len(mm2.servers) != 1 || mm2.servers[0].Addr != "chat:9000" {
+		t.Fatalf("expected one known server, got %#v", mm2.servers)
+	}
+}
+
+func TestAttestVerdictFlow(t *testing.T) {
+	// A green verdict goes to the verdict screen with Connect focused and no
+	// countdown.
+	m := NewModel(&Core{})
+	out, _ := m.Update(attestMsg{server: "s:1", verdict: "green", tier: "tee", buildHash: "abc"})
+	mm := out.(Model)
+	if mm.screen != screenVerdict {
+		t.Fatalf("expected verdict screen, got %v", mm.screen)
+	}
+	if mm.verdictSel != 1 {
+		t.Fatalf("green verdict should default to Connect, got sel=%d", mm.verdictSel)
+	}
+	if mm.verdictCountdown != 0 {
+		t.Fatalf("green verdict should have no countdown, got %d", mm.verdictCountdown)
+	}
+
+	// A red verdict starts a 10s countdown defaulting to Cancel; Connect anyway
+	// must be blocked until it elapses.
+	mr := NewModel(&Core{})
+	outr, cmd := mr.Update(attestMsg{server: "evil:9000", verdict: "red", tier: "unsigned", publicCodebaseURL: "https://gh"})
+	mmr := outr.(Model)
+	if mmr.verdictCountdown != redCountdownSecs {
+		t.Fatalf("red verdict should start a %ds countdown, got %d", redCountdownSecs, mmr.verdictCountdown)
+	}
+	if mmr.verdictSel != 0 {
+		t.Fatalf("red verdict should default to Cancel, got sel=%d", mmr.verdictSel)
+	}
+	if cmd == nil {
+		t.Fatalf("red verdict should schedule a countdown tick")
+	}
+
+	// Selecting Connect anyway while counting down does not connect.
+	mmr.verdictSel = 1
+	out2, cmd2 := mmr.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mmr = out2.(Model)
+	if mmr.screen != screenVerdict {
+		t.Fatalf("Connect anyway during countdown should stay on verdict screen")
+	}
+	_ = cmd2
+
+	// Ticks decrement the countdown; once it hits zero Connect anyway works.
+	for mmr.verdictCountdown > 0 {
+		o, _ := mmr.Update(verdictTickMsg{})
+		mmr = o.(Model)
+	}
+	out3, cmd3 := mmr.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mmr = out3.(Model)
+	if cmd3 == nil {
+		t.Fatalf("Connect anyway after countdown should issue a connect command")
+	}
+}
+
+func TestNeedUsernameFlow(t *testing.T) {
+	m := NewModel(&Core{})
+	out, _ := m.Update(needUsernameMsg{server: "chat:9000"})
+	mm := out.(Model)
+	if mm.screen != screenUsername {
+		t.Fatalf("expected username screen, got %v", mm.screen)
+	}
+	if mm.pendingServer != "chat:9000" {
+		t.Fatalf("expected pendingServer chat:9000, got %q", mm.pendingServer)
+	}
+}
+
+func TestConnectedEntersChat(t *testing.T) {
+	m := NewModel(&Core{})
+	out, _ := m.Update(connectedMsg{server: "chat:9000", username: "alice", active: true})
+	mm := out.(Model)
+	if mm.screen != screenChat {
+		t.Fatalf("expected chat screen after connected, got %v", mm.screen)
+	}
+	if mm.serverAddr != "chat:9000" || mm.username != "alice" || !mm.connected {
+		t.Fatalf("connected state not applied: %+v", mm)
+	}
+}
+
+func TestFingerprintStored(t *testing.T) {
+	m := NewModel(&Core{})
+	out, _ := m.Update(fingerprintMsg{username: "bob", fingerprint: "AB CD EF"})
+	mm := out.(Model)
+	if mm.fingerprints["bob"] != "AB CD EF" {
+		t.Fatalf("expected fingerprint stored for bob, got %q", mm.fingerprints["bob"])
 	}
 }
 

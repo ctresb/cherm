@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "crypto", "server", "core"]
+members = ["proto", "crypto", "attest", "server", "core"]
 
 [workspace.package]
 edition = "2021"
@@ -32,16 +32,29 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
 dirs = "5"
 
+# Privacy / message layer (Matrix's audited Olm+Megolm)
+vodozemac = "0.10"
+# Attestation: AWS Nitro TEE quote verification (pure-Rust) + software signatures
+coset = "0.4"
+ciborium = "0.2"
+serde_bytes = "0.11"
+p384 = "0.13"
+x509-cert = { version = "0.2", features = ["pem"] }
+minisign-verify = "0.2"
+blake3 = "1"
+hex = "0.4"
+
 # Local crates
 cherm-proto = { path = "proto" }
 cherm-crypto = { path = "crypto" }
+cherm-attest = { path = "attest" }
 
 [profile.release]
 lto = true

@@ -1,85 +1,123 @@
-//! The client engine: application state plus one handler per IPC command.
+//! The client engine: multi-server application state plus one handler per IPC
+//! command (PROTOCOL.md section 4).
 //!
-//! `App` owns the shared identity, the local database handle, the event emitter
-//! and (when connected) the live [`ServerLink`] + reader task. Commands arrive
-//! one at a time from stdin and are dispatched sequentially in [`App::run`], so
-//! there is only ever a single outstanding control request to the server — the
-//! invariant the single-slot oneshot in `net` relies on.
+//! `App` owns the local master key, the event emitter, a `servers.json` index
+//! and a map of per-server [`Server`]s (each holding its encrypted vault and,
+//! when connected, a live [`ServerLink`] + reader). Chat commands act on the
+//! **active** server. Commands arrive one at a time from stdin and are
+//! dispatched sequentially in [`App::run`].
 
 use anyhow::{anyhow, Result};
-use cherm_crypto::Identity;
-use cherm_proto::{valid_username, ClientMsg, ServerMsg};
-use serde_json::json;
-use std::os::unix::fs::PermissionsExt;
+use cherm_crypto::Device;
+use cherm_proto::{valid_username, ClientMsg, OneTimeKey, ServerMsg};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::task::JoinHandle;
 
-use crate::db::{self, Db};
 use crate::ipc::{err_event, Command, Events};
-use crate::net::{self, GroupInvite, ServerLink};
-use crate::now_millis;
+use crate::net::{self, ServerLink};
+use crate::vault::{self, Vault};
+use crate::{attest_client, now_millis};
 
-/// Result of resolving a peer's X25519 public key.
-enum Resolved {
-    /// We have their base64 dh_pub.
-    Found(String),
-    /// The server returned an error (e.g. `unknown_user`).
-    Err(String, String),
+/// Number of one-time keys published per (re)connect.
+const PREKEY_BATCH: usize = 20;
+
+// ===========================================================================
+// Persisted server index (~/.cherm/servers.json)
+// ===========================================================================
+
+/// One known server: its address plus the last cached attestation verdict and
+/// the username registered there (if any).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerRecord {
+    pub addr: String,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
-/// All client state.
-pub struct App {
-    /// `~/.cherm` directory.
-    home: PathBuf,
-    /// Our long-lived identity, present once registered (or generated).
-    identity: Option<Arc<Identity>>,
-    /// Local SQLite handle.
-    db: Db,
-    /// Event emitter to the TUI (single serialized writer).
-    events: Events,
-    /// Our username, set from `meta` once registered.
-    username: Option<String>,
-    /// Live server connection, when connected.
+/// The list of known servers, persisted as `servers.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerIndex {
+    #[serde(default)]
+    pub servers: Vec<ServerRecord>,
+}
+
+impl ServerIndex {
+    fn record_mut(&mut self, addr: &str) -> &mut ServerRecord {
+        if let Some(i) = self.servers.iter().position(|s| s.addr == addr) {
+            return &mut self.servers[i];
+        }
+        self.servers.push(ServerRecord {
+            addr: addr.to_string(),
+            ..Default::default()
+        });
+        self.servers.last_mut().expect("just pushed")
+    }
+
+    fn ensure(&mut self, addr: &str) {
+        let _ = self.record_mut(addr);
+    }
+
+    fn set_attest(&mut self, addr: &str, verdict: &str, tier: &str) {
+        let r = self.record_mut(addr);
+        r.verdict = Some(verdict.to_string());
+        r.tier = Some(tier.to_string());
+    }
+
+    fn set_username(&mut self, addr: &str, username: &str) {
+        self.record_mut(addr).username = Some(username.to_string());
+    }
+}
+
+// ===========================================================================
+// Per-server runtime state
+// ===========================================================================
+
+/// One server's vault + (when connected) live link and reader task.
+struct Server {
+    vault: Vault,
+    vault_key: [u8; 32],
     link: Option<ServerLink>,
-    /// Handle to the reader task for the live connection (so we can abort it).
     reader: Option<JoinHandle<()>>,
 }
 
+// ===========================================================================
+// App
+// ===========================================================================
+
+pub struct App {
+    home: PathBuf,
+    master: [u8; 32],
+    events: Events,
+    index: ServerIndex,
+    servers: HashMap<String, Server>,
+    active: Option<String>,
+}
+
 impl App {
-    pub fn new(
-        home: PathBuf,
-        identity: Option<Arc<Identity>>,
-        db: Db,
-        events: Events,
-        username: Option<String>,
-    ) -> Self {
+    pub fn new(home: PathBuf, master: [u8; 32], events: Events, index: ServerIndex) -> Self {
         App {
             home,
-            identity,
-            db,
+            master,
             events,
-            username,
-            link: None,
-            reader: None,
+            index,
+            servers: HashMap::new(),
+            active: None,
         }
-    }
-
-    /// Our username, cloned (for the `ready`/`status` events).
-    pub fn username(&self) -> Option<String> {
-        self.username.clone()
-    }
-
-    /// "registered" = an identity exists AND a username is stored in `meta`.
-    pub fn registered(&self) -> bool {
-        self.identity.is_some() && self.username.is_some()
     }
 
     // -- main loop ----------------------------------------------------------
 
-    /// Read newline-delimited commands from stdin until EOF, dispatching each.
     pub async fn run(&mut self) -> Result<()> {
+        self.emit_ready();
+
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
@@ -88,9 +126,8 @@ impl App {
             }
             match serde_json::from_str::<Command>(line) {
                 Ok(cmd) => {
+                    self.prune_dead_links();
                     if let Err(e) = self.handle(cmd).await {
-                        // Unexpected internal failures surface as an error event
-                        // rather than killing the engine.
                         self.events.emit(err_event("internal", &e.to_string()));
                     }
                 }
@@ -100,24 +137,24 @@ impl App {
                 }
             }
         }
-        // stdin closed: flush and let the process exit cleanly.
         self.events.shutdown().await;
         Ok(())
     }
 
     async fn handle(&mut self, cmd: Command) -> Result<()> {
-        // If the reader task has exited (the server dropped the connection),
-        // clear the now-dead link so commands report `not_connected` and
-        // `status` reflects reality instead of using a stale, broken link.
-        self.prune_dead_link();
         match cmd {
-            Command::Status => self.status(),
-            Command::Register { username, server } => self.register(username, server).await,
+            Command::ListServers => {
+                self.emit_servers();
+                Ok(())
+            }
+            Command::CheckServer { server } => self.check_server(server).await,
             Command::Connect { server } => self.connect(server).await,
-            Command::ListChats => self.emit_chats(),
+            Command::Register { server, username } => self.register(server, username).await,
+            Command::SwitchServer { server } => self.switch_server(server).await,
+            Command::ListChats => self.list_chats(),
+            Command::History { chat, limit } => self.history(&chat, limit.unwrap_or(200)),
             Command::StartDm { username } => self.start_dm(username).await,
             Command::CreateGroup { name, members } => self.create_group(name, members).await,
-            Command::History { chat, limit } => self.emit_history(&chat, limit.unwrap_or(200)),
             Command::Send { chat, text } => self.send(chat, text).await,
             Command::Ping => self.ping().await,
             Command::Quit => self.quit().await,
@@ -126,20 +163,39 @@ impl App {
 
     // -- commands -----------------------------------------------------------
 
-    /// `status` -> emit current connection/registration state.
-    fn status(&self) -> Result<()> {
-        self.events.emit(json!({
-            "event": "status",
-            "connected": self.link.is_some(),
-            "registered": self.registered(),
-            "username": self.username(),
-        }));
+    /// `check_server` -> attest a server pre-auth and cache its verdict.
+    async fn check_server(&mut self, server: String) -> Result<()> {
+        self.index.ensure(&server);
+        match attest_client::check_server(&server).await {
+            Ok(out) => {
+                self.events.emit(json!({
+                    "event": "attest",
+                    "server": server,
+                    "verdict": attest_client::verdict_str(out.verdict),
+                    "tier": attest_client::tier_str(out.tier),
+                    "reason": out.reason,
+                    "build_hash": out.build_hash,
+                    "fingerprint": out.fingerprint,
+                    "public_codebase_url": cherm_attest::PUBLIC_CODEBASE_URL,
+                    "signatures_url": cherm_attest::SIGNATURES_URL,
+                }));
+                self.index.set_attest(
+                    &server,
+                    attest_client::verdict_str(out.verdict),
+                    attest_client::tier_str(out.tier),
+                );
+            }
+            Err(e) => {
+                self.events
+                    .emit(err_event("check_failed", &e.to_string()));
+            }
+        }
+        self.save_index()?;
         Ok(())
     }
 
-    /// `register` -> create identity (if needed), connect, register on the
-    /// server, persist identity, and start the live session.
-    async fn register(&mut self, username: String, server: String) -> Result<()> {
+    /// `register` -> create identity + vault on a server and go live.
+    async fn register(&mut self, server: String, username: String) -> Result<()> {
         if !valid_username(&username) {
             self.events.emit(err_event(
                 cherm_proto::errcode::USERNAME_INVALID,
@@ -148,71 +204,94 @@ impl App {
             return Ok(());
         }
 
-        // Ensure we have an identity, generating + persisting one on first run.
-        let id = match self.identity.clone() {
-            Some(id) => id,
+        self.ensure_server(&server)?;
+        let (vault, vk) = self.vault_of(&server);
+
+        // Ensure a Device exists (generate + persist on first run).
+        let device = match vault::load_account(&vault, &vk)? {
+            Some(d) => d,
             None => {
-                let id = Identity::generate();
-                self.save_identity(&id)?;
-                let id = Arc::new(id);
-                self.identity = Some(id.clone());
-                id
+                let d = Device::generate();
+                vault::save_account(&vault, &vk, &d)?;
+                d
             }
         };
+        let ed = device.ed25519_b64();
+        let curve = device.curve25519_b64();
 
-        // Replace any prior connection.
-        self.teardown_link();
+        self.teardown_link(&server);
         let (read_half, link) = match net::open(&server).await {
-            Ok(pair) => pair,
+            Ok(p) => p,
             Err(e) => {
-                self.events
-                    .emit(err_event("connect_failed", &e.to_string()));
+                self.events.emit(err_event("connect_failed", &e.to_string()));
                 return Ok(());
             }
         };
         // Start the reader BEFORE the handshake so `send_and_wait` can be
-        // fulfilled by it. (It only forwards control frames to the oneshot;
-        // no Deliver can arrive until we are authenticated.)
+        // fulfilled by it (no Deliver can arrive before we are authenticated).
         let handle = net::spawn_reader(
             read_half,
-            net::ReaderCtx {
-                identity: id.clone(),
-                db: self.db.clone(),
-                events: self.events.clone(),
-                pending: link.pending.clone(),
-                me: username.clone(),
-            },
+            link.clone(),
+            vault.clone(),
+            vk,
+            self.events.clone(),
+            username.clone(),
+            server.clone(),
         );
 
-        let machine_id = machine_id();
         let reply = net::send_and_wait(
             &link,
             ClientMsg::Register {
                 username: username.clone(),
-                ed_pub: id.ed_public_b64(),
-                dh_pub: id.dh_public_b64(),
-                machine_id,
+                ed25519: ed,
+                curve25519: curve,
+                machine_id: machine_id(),
             },
         )
         .await?;
 
         match reply {
             ServerMsg::AuthOk { uuid, username: uname } => {
-                db::meta_set(&self.db, "username", &uname)?;
-                db::meta_set(&self.db, "uuid", &uuid)?;
-                db::meta_set(&self.db, "server", &server)?;
-                // Record ourselves as a contact so group rosters resolve.
-                db::upsert_contact(&self.db, &uname, &uuid, &id.ed_public_b64(), &id.dh_public_b64())?;
+                vault::meta_set(&vault, "username", &uname)?;
+                vault::meta_set(&vault, "uuid", &uuid)?;
+                vault::meta_set(&vault, "server", &server)?;
+                vault::upsert_contact(
+                    &vault,
+                    &uname,
+                    &uuid,
+                    &device.ed25519_b64(),
+                    &device.curve25519_b64(),
+                )?;
 
-                self.username = Some(uname.clone());
-                self.link = Some(link);
-                self.reader = Some(handle);
+                // Publish a fresh batch of one-time keys, then persist the
+                // account (now holding the published OTK private halves).
+                let mut device = device;
+                let otks = device.generate_one_time_keys(PREKEY_BATCH);
+                device.mark_published();
+                vault::save_account(&vault, &vk, &device)?;
+                let one_time_keys = to_otks(otks);
 
+                if let Some(s) = self.servers.get_mut(&server) {
+                    s.link = Some(link.clone());
+                    s.reader = Some(handle);
+                }
+                self.active = Some(server.clone());
+
+                let _ = net::send_and_wait(&link, ClientMsg::PublishPrekeys { one_time_keys }).await;
+                let _ = net::send(&link, ClientMsg::Pull);
+
+                self.index.set_username(&server, &uname);
+                self.save_index()?;
+
+                self.events.emit(
+                    json!({"event": "registered", "server": server, "username": uname, "uuid": uuid}),
+                );
+                self.events.emit(
+                    json!({"event": "connected", "server": server, "username": uname, "active": true}),
+                );
                 self.events
-                    .emit(json!({"event": "registered", "username": uname, "uuid": uuid}));
-                self.events
-                    .emit(json!({"event": "connected", "username": uname, "uuid": uuid}));
-                self.emit_chats()?;
+                    .emit(vault::build_chats_event(&vault, &server)?);
+                self.emit_servers();
             }
             ServerMsg::Error { code, message } => {
                 handle.abort();
@@ -220,58 +299,56 @@ impl App {
             }
             other => {
                 handle.abort();
-                self.events.emit(err_event(
-                    "internal",
-                    &format!("unexpected register reply: {other:?}"),
-                ));
+                self.events
+                    .emit(err_event("internal", &format!("unexpected register reply: {other:?}")));
             }
         }
         Ok(())
     }
 
-    /// `connect` -> authenticate with the stored identity, then pull offline
-    /// messages.
+    /// `connect` -> challenge-response auth with the stored identity, replenish
+    /// prekeys, pull offline messages, and make active.
     async fn connect(&mut self, server: String) -> Result<()> {
-        let id = match self.identity.clone() {
-            Some(id) => id,
-            None => {
-                self.events
-                    .emit(err_event("not_registered", "no local identity; register first"));
-                return Ok(());
-            }
-        };
-        let username = match self.username.clone() {
+        self.ensure_server(&server)?;
+        let (vault, vk) = self.vault_of(&server);
+
+        let username = match vault::meta_get(&vault, "username")? {
             Some(u) => u,
             None => {
                 self.events
-                    .emit(err_event("not_registered", "no username; register first"));
+                    .emit(json!({"event": "need_username", "server": server}));
+                return Ok(());
+            }
+        };
+        let device = match vault::load_account(&vault, &vk)? {
+            Some(d) => d,
+            None => {
+                self.events
+                    .emit(err_event("internal", "username present but no device in vault"));
                 return Ok(());
             }
         };
 
-        self.teardown_link();
+        self.teardown_link(&server);
         let (read_half, link) = match net::open(&server).await {
-            Ok(pair) => pair,
+            Ok(p) => p,
             Err(e) => {
-                self.events
-                    .emit(err_event("connect_failed", &e.to_string()));
+                self.events.emit(err_event("connect_failed", &e.to_string()));
                 return Ok(());
             }
         };
         let handle = net::spawn_reader(
             read_half,
-            net::ReaderCtx {
-                identity: id.clone(),
-                db: self.db.clone(),
-                events: self.events.clone(),
-                pending: link.pending.clone(),
-                me: username.clone(),
-            },
+            link.clone(),
+            vault.clone(),
+            vk,
+            self.events.clone(),
+            username.clone(),
+            server.clone(),
         );
 
-        // Challenge-response: AuthBegin -> Challenge -> AuthFinish -> AuthOk.
-        let challenge = net::send_and_wait(&link, ClientMsg::AuthBegin { username: username.clone() }).await?;
-        let nonce = match challenge {
+        // AuthBegin -> Challenge -> sign(b64decode(nonce)) -> AuthFinish -> AuthOk.
+        let nonce = match net::send_and_wait(&link, ClientMsg::AuthBegin { username: username.clone() }).await? {
             ServerMsg::Challenge { nonce } => nonce,
             ServerMsg::Error { code, message } => {
                 handle.abort();
@@ -281,13 +358,10 @@ impl App {
             other => {
                 handle.abort();
                 self.events
-                    .emit(err_event("internal", &format!("unexpected challenge reply: {other:?}")));
+                    .emit(err_event("internal", &format!("unexpected challenge: {other:?}")));
                 return Ok(());
             }
         };
-
-        // Sign the RAW decoded nonce bytes (PROTOCOL.md section 1). A malformed
-        // nonce must not bubble up and leak the spawned reader task.
         let nonce_bytes = match cherm_crypto::b64_decode(&nonce) {
             Ok(b) => b,
             Err(e) => {
@@ -297,16 +371,13 @@ impl App {
                 return Ok(());
             }
         };
-        let signature = id.sign_b64(&nonce_bytes);
-        let authok = net::send_and_wait(
+        let signature = device.sign_b64(&nonce_bytes);
+        let (uuid, uname) = match net::send_and_wait(
             &link,
-            ClientMsg::AuthFinish {
-                username: username.clone(),
-                signature,
-            },
+            ClientMsg::AuthFinish { username: username.clone(), signature },
         )
-        .await?;
-        let (uuid, uname) = match authok {
+        .await?
+        {
             ServerMsg::AuthOk { uuid, username } => (uuid, username),
             ServerMsg::Error { code, message } => {
                 handle.abort();
@@ -321,159 +392,305 @@ impl App {
             }
         };
 
-        db::meta_set(&self.db, "server", &server)?;
-        db::meta_set(&self.db, "uuid", &uuid)?;
-        self.username = Some(uname.clone());
-        self.link = Some(link.clone());
-        self.reader = Some(handle);
+        vault::meta_set(&vault, "uuid", &uuid)?;
+        vault::meta_set(&vault, "server", &server)?;
 
-        // Ask for anything queued while we were offline (arrives as Delivers).
-        net::send(&link, ClientMsg::Pull)?;
+        // Replenish one-time keys so peers can keep starting sessions.
+        let mut device = device;
+        let otks = device.generate_one_time_keys(PREKEY_BATCH);
+        device.mark_published();
+        vault::save_account(&vault, &vk, &device)?;
+        let one_time_keys = to_otks(otks);
 
-        self.events
-            .emit(json!({"event": "connected", "username": uname, "uuid": uuid}));
-        self.emit_chats()?;
+        if let Some(s) = self.servers.get_mut(&server) {
+            s.link = Some(link.clone());
+            s.reader = Some(handle);
+        }
+        self.active = Some(server.clone());
+
+        let _ = net::send_and_wait(&link, ClientMsg::PublishPrekeys { one_time_keys }).await;
+        let _ = net::send(&link, ClientMsg::Pull);
+
+        self.index.set_username(&server, &uname);
+        self.save_index()?;
+
+        self.events.emit(
+            json!({"event": "connected", "server": server, "username": uname, "active": true}),
+        );
+        self.events.emit(vault::build_chats_event(&vault, &server)?);
+        self.emit_servers();
         Ok(())
     }
 
-    /// `start_dm` -> resolve the peer's keys if needed and ensure a DM chat.
+    /// `switch_server` -> make active and surface its chats (connecting if needed).
+    async fn switch_server(&mut self, server: String) -> Result<()> {
+        self.ensure_server(&server)?;
+        self.prune_dead_links();
+        self.active = Some(server.clone());
+
+        let has_link = self
+            .servers
+            .get(&server)
+            .map(|s| s.link.is_some())
+            .unwrap_or(false);
+        let (vault, _vk) = self.vault_of(&server);
+
+        if has_link {
+            self.events.emit(vault::build_chats_event(&vault, &server)?);
+            self.emit_servers();
+        } else if vault::meta_get(&vault, "username")?.is_some() {
+            self.connect(server).await?;
+        } else {
+            self.events
+                .emit(json!({"event": "need_username", "server": server}));
+            self.events.emit(vault::build_chats_event(&vault, &server)?);
+            self.emit_servers();
+        }
+        Ok(())
+    }
+
+    /// `start_dm` -> ensure an Olm session to the peer and a DM chat.
     async fn start_dm(&mut self, username: String) -> Result<()> {
-        let me = match self.username.clone() {
-            Some(u) => u,
+        let (server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
             None => {
-                self.events
-                    .emit(err_event("not_registered", "register first"));
+                self.events.emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
-
-        // A user cannot open a chat with themselves.
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
         if username == me {
-            self.events.emit(err_event(
-                "self_dm",
-                "you can't start a chat with yourself",
-            ));
+            self.events
+                .emit(err_event("self_dm", "you can't start a chat with yourself"));
             return Ok(());
         }
+        let link = match self.active_link() {
+            Some(l) => l,
+            None => {
+                self.events.emit(err_event("not_connected", "not connected"));
+                return Ok(());
+            }
+        };
 
-        // Resolve keys (Lookup) only if we don't already know them.
-        if db::get_contact_dh(&self.db, &username)?.is_none() {
-            let link = match self.link.clone() {
-                Some(l) => l,
-                None => {
-                    self.events
-                        .emit(err_event("not_connected", "not connected to a server"));
+        // Establish an outbound Olm session if we don't already have one.
+        if vault::load_olm(&vault, &vk, &username)?.is_none() {
+            match net::send_and_wait(&link, ClientMsg::FetchPrekeys { username: username.clone() })
+                .await?
+            {
+                ServerMsg::PrekeyBundle {
+                    username: u,
+                    uuid,
+                    ed25519,
+                    curve25519,
+                    one_time_key,
+                    ..
+                } => {
+                    let otk = match one_time_key {
+                        Some(k) => k,
+                        None => {
+                            self.events.emit(err_event(
+                                cherm_proto::errcode::NO_PREKEYS,
+                                &format!("{u} has no one-time keys available"),
+                            ));
+                            return Ok(());
+                        }
+                    };
+                    let device = vault::load_account(&vault, &vk)?
+                        .ok_or_else(|| anyhow!("no device identity"))?;
+                    let session = device.start_session(&curve25519, &otk)?;
+                    vault::save_olm(&vault, &vk, &username, &session)?;
+                    vault::upsert_contact(&vault, &u, &uuid, &ed25519, &curve25519)?;
+                }
+                ServerMsg::Error { code, message } => {
+                    self.events.emit(err_event(&code, &message));
                     return Ok(());
                 }
-            };
-            match self.resolve_dh(&link, &username).await? {
-                Resolved::Found(_) => {}
-                Resolved::Err(code, message) => {
-                    self.events.emit(err_event(&code, &message));
+                other => {
+                    self.events
+                        .emit(err_event("internal", &format!("unexpected prekey reply: {other:?}")));
                     return Ok(());
                 }
             }
         }
 
-        db::upsert_chat(&self.db, &username, "dm", &username, None)?;
-        db::add_member(&self.db, &username, &me)?;
-        db::add_member(&self.db, &username, &username)?;
+        vault::upsert_chat(&vault, &username, "dm", &username)?;
+        vault::add_member(&vault, &username, &me)?;
+        vault::add_member(&vault, &username, &username)?;
 
-        self.emit_chats()?;
-        self.emit_history(&username, 200)?;
+        if let Some(ed) = vault::get_contact_ed(&vault, &username)? {
+            self.events.emit(json!({
+                "event": "fingerprint", "username": username,
+                "fingerprint": cherm_crypto::fingerprint_of(&ed)
+            }));
+        }
+        self.events.emit(vault::build_chats_event(&vault, &server)?);
+        self.emit_history(&vault, &username, 200)?;
         Ok(())
     }
 
-    /// `create_group` -> mint a group key, create the local room, and seal an
-    /// invite (key + roster) to each other member.
+    /// `create_group` -> mint a Megolm session, create the room, and share the
+    /// session key to each member over their pairwise Olm channel.
     async fn create_group(&mut self, name: String, members: Vec<String>) -> Result<()> {
-        let me = match self.username.clone() {
-            Some(u) => u,
+        let (server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
             None => {
-                self.events
-                    .emit(err_event("not_registered", "register first"));
+                self.events.emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
-        let link = match self.link.clone() {
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
+        let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events
-                    .emit(err_event("not_connected", "not connected to a server"));
+                self.events.emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
 
-        let key = cherm_crypto::gen_group_key();
-        let key_b64 = cherm_crypto::b64_encode(&key);
+        let sender = cherm_crypto::GroupSender::new();
         let group_id = uuid::Uuid::new_v4().to_string();
+        vault::save_group_out(&vault, &vk, &group_id, &sender)?;
 
-        // Resolve each (other) member's dh_pub and build the full roster.
+        // Roster = {self} + members (deduped).
         let mut roster = vec![me.clone()];
-        let mut member_keys: Vec<(String, String)> = Vec::new();
-        for member in &members {
-            if member == &me {
+        for m in &members {
+            if m != &me && !roster.contains(m) {
+                roster.push(m.clone());
+            }
+        }
+        vault::upsert_chat(&vault, &group_id, "group", &name)?;
+        for m in &roster {
+            vault::add_member(&vault, &group_id, m)?;
+        }
+
+        self.distribute_group_key(&vault, &vk, &link, &me, &group_id, &name, &roster, &sender)
+            .await?;
+
+        self.events.emit(vault::build_chats_event(&vault, &server)?);
+        Ok(())
+    }
+
+    /// Share a Megolm outbound session key with every other member over their
+    /// pairwise Olm session. Megolm is per-sender, so each member that wants to
+    /// speak in a group mints its own [`GroupSender`] and distributes it here
+    /// (called by `create_group` and lazily by `send` for non-creators).
+    #[allow(clippy::too_many_arguments)]
+    async fn distribute_group_key(
+        &self,
+        vault: &Vault,
+        vk: &[u8; 32],
+        link: &ServerLink,
+        me: &str,
+        group_id: &str,
+        name: &str,
+        roster: &[String],
+        sender: &cherm_crypto::GroupSender,
+    ) -> Result<()> {
+        let device = vault::load_account(vault, vk)?
+            .ok_or_else(|| anyhow!("no device identity"))?;
+        let sender_curve = device.curve25519_b64();
+        let session_key = sender.session_key_b64();
+        let now = now_millis();
+
+        for member in roster {
+            if member == me {
                 continue;
             }
-            match self.resolve_dh(&link, member).await? {
-                Resolved::Found(dh) => {
-                    if !roster.contains(member) {
-                        roster.push(member.clone());
+            // Ensure an Olm session to this member.
+            let mut session = match vault::load_olm(vault, vk, member)? {
+                Some(s) => s,
+                None => match net::send_and_wait(
+                    link,
+                    ClientMsg::FetchPrekeys { username: member.clone() },
+                )
+                .await?
+                {
+                    ServerMsg::PrekeyBundle {
+                        username: u,
+                        uuid,
+                        ed25519,
+                        curve25519,
+                        one_time_key: Some(otk),
+                        ..
+                    } => {
+                        vault::upsert_contact(vault, &u, &uuid, &ed25519, &curve25519)?;
+                        device.start_session(&curve25519, &otk)?
                     }
-                    member_keys.push((member.clone(), dh));
-                }
-                Resolved::Err(code, message) => {
-                    self.events.emit(err_event(&code, &message));
-                    return Ok(());
-                }
-            }
-        }
+                    ServerMsg::PrekeyBundle { .. } => {
+                        self.events.emit(err_event(
+                            cherm_proto::errcode::NO_PREKEYS,
+                            &format!("{member} has no one-time keys; skipped"),
+                        ));
+                        continue;
+                    }
+                    ServerMsg::Error { code, message } => {
+                        self.events.emit(err_event(&code, &message));
+                        continue;
+                    }
+                    other => {
+                        self.events.emit(err_event(
+                            "internal",
+                            &format!("unexpected prekey reply: {other:?}"),
+                        ));
+                        continue;
+                    }
+                },
+            };
 
-        // Create the local room.
-        db::upsert_chat(&self.db, &group_id, "group", &name, Some(key_b64.clone()))?;
-        for member in &roster {
-            db::add_member(&self.db, &group_id, member)?;
-        }
+            let share = json!({
+                "group_id": group_id,
+                "name": name,
+                "session_key": session_key.clone(),
+                "sender_curve": sender_curve.clone(),
+                "members": roster,
+            });
+            let plaintext = serde_json::to_vec(&share)?;
+            let (t, body) = session.encrypt(&plaintext)?;
+            vault::save_olm(vault, vk, member, &session)?;
 
-        // Seal the invite to every other member individually.
-        let invite = GroupInvite {
-            group_id: group_id.clone(),
-            name: name.clone(),
-            key: key_b64,
-            members: roster,
-        };
-        let invite_json = serde_json::to_vec(&invite)?;
-        let now = now_millis();
-        for (member, dh) in &member_keys {
-            let payload = cherm_crypto::seal_b64(dh, &invite_json)?;
             net::send(
-                &link,
+                link,
                 ClientMsg::Send {
                     to: vec![member.clone()],
-                    msg_type: "group_invite".to_string(),
-                    payload,
-                    group_id: Some(group_id.clone()),
+                    msg_type: "olm_group_key".to_string(),
+                    payload: net::encode_olm(t, &body),
+                    group_id: Some(group_id.to_string()),
                     client_ts: now,
                 },
             )?;
         }
-
-        self.emit_chats()?;
         Ok(())
     }
 
-    /// `send` -> encrypt for the chat, relay it, store our plaintext, and echo
-    /// the outgoing message back to the TUI.
+    /// `send` -> encrypt for the chat, relay it, store our plaintext, and echo.
     async fn send(&mut self, chat: String, text: String) -> Result<()> {
-        let me = match self.username.clone() {
-            Some(u) => u,
+        let (_server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
             None => {
-                self.events
-                    .emit(err_event("not_registered", "register first"));
+                self.events.emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
-        let (kind, group_key) = match db::get_chat(&self.db, &chat)? {
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
+        let (kind, title) = match vault::get_chat(&vault, &chat)? {
             Some(c) => c,
             None => {
                 self.events
@@ -481,11 +698,10 @@ impl App {
                 return Ok(());
             }
         };
-        let link = match self.link.clone() {
+        let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events
-                    .emit(err_event("not_connected", "not connected to a server"));
+                self.events.emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
@@ -493,35 +709,45 @@ impl App {
         let now = now_millis();
         match kind.as_str() {
             "dm" => {
-                // The DM chat id is the peer's username.
                 let peer = chat.clone();
-                let dh = match self.resolve_dh(&link, &peer).await? {
-                    Resolved::Found(dh) => dh,
-                    Resolved::Err(code, message) => {
-                        self.events.emit(err_event(&code, &message));
+                let mut session = match vault::load_olm(&vault, &vk, &peer)? {
+                    Some(s) => s,
+                    None => {
+                        self.events
+                            .emit(err_event("no_session", "no Olm session; start_dm first"));
                         return Ok(());
                     }
                 };
-                let payload = cherm_crypto::seal_b64(&dh, text.as_bytes())?;
+                let (t, body) = session.encrypt(text.as_bytes())?;
+                vault::save_olm(&vault, &vk, &peer, &session)?;
                 net::send(
                     &link,
                     ClientMsg::Send {
                         to: vec![peer],
-                        msg_type: "msg".to_string(),
-                        payload,
+                        msg_type: "olm".to_string(),
+                        payload: net::encode_olm(t, &body),
                         group_id: None,
                         client_ts: now,
                     },
                 )?;
             }
             "group" => {
-                let group_key =
-                    group_key.ok_or_else(|| anyhow!("group chat {chat} has no key"))?;
-                let key = net::group_key_from_b64(&group_key)?;
-                let blob = cherm_crypto::group_encrypt(&key, text.as_bytes())?;
-                let payload = cherm_crypto::b64_encode(&blob);
-                // Fan out to every member except ourselves.
-                let recipients: Vec<String> = db::get_members(&self.db, &chat)?
+                let mut sender = match vault::load_group_out(&vault, &vk, &chat)? {
+                    Some(s) => s,
+                    None => {
+                        // Megolm is per-sender: lazily mint our own outbound
+                        // session and share it with the group before sending.
+                        let roster = vault::get_members(&vault, &chat)?;
+                        let s = cherm_crypto::GroupSender::new();
+                        vault::save_group_out(&vault, &vk, &chat, &s)?;
+                        self.distribute_group_key(&vault, &vk, &link, &me, &chat, &title, &roster, &s)
+                            .await?;
+                        s
+                    }
+                };
+                let bytes = sender.encrypt(text.as_bytes());
+                vault::save_group_out(&vault, &vk, &chat, &sender)?;
+                let recipients: Vec<String> = vault::get_members(&vault, &chat)?
                     .into_iter()
                     .filter(|m| *m != me)
                     .collect();
@@ -529,8 +755,8 @@ impl App {
                     &link,
                     ClientMsg::Send {
                         to: recipients,
-                        msg_type: "group_msg".to_string(),
-                        payload,
+                        msg_type: "megolm".to_string(),
+                        payload: cherm_crypto::b64_encode(&bytes),
                         group_id: Some(chat.clone()),
                         client_ts: now,
                     },
@@ -543,8 +769,7 @@ impl App {
             }
         }
 
-        // Persist our own plaintext and echo it locally.
-        db::insert_message(&self.db, &chat, &me, &text, now, 1)?;
+        vault::insert_message(&vault, &chat, &me, &text, now, 1)?;
         self.events.emit(json!({
             "event": "message", "chat": chat, "from": me,
             "text": text, "ts": now, "outgoing": true, "color": null
@@ -552,37 +777,61 @@ impl App {
         Ok(())
     }
 
-    /// `ping` -> measure round-trip latency to the server and report it.
+    /// `ping` -> measure round-trip latency to the active server.
     async fn ping(&mut self) -> Result<()> {
-        let link = match self.link.clone() {
-            Some(l) => l,
+        let server = match self.active.clone() {
+            Some(s) => s,
             None => {
-                self.events
-                    .emit(err_event("not_connected", "not connected to a server"));
+                self.events.emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
-        let server = db::meta_get(&self.db, "server")?.unwrap_or_default();
+        let link = match self.active_link() {
+            Some(l) => l,
+            None => {
+                self.events.emit(err_event("not_connected", "not connected"));
+                return Ok(());
+            }
+        };
         let start = std::time::Instant::now();
         let reply = net::send_and_wait(&link, ClientMsg::Ping).await?;
         let rtt = start.elapsed().as_millis() as i64;
         match reply {
             ServerMsg::Pong => {
-                self.events.emit(json!({
-                    "event": "pong", "rtt_ms": rtt, "server": server
-                }));
+                self.events
+                    .emit(json!({"event": "pong", "rtt_ms": rtt, "server": server}));
             }
             other => {
-                self.events.emit(err_event(
-                    "internal",
-                    &format!("unexpected ping reply: {other:?}"),
-                ));
+                self.events
+                    .emit(err_event("internal", &format!("unexpected ping reply: {other:?}")));
             }
         }
         Ok(())
     }
 
-    /// `quit` -> flush all queued events, then exit the process.
+    /// `list_chats` -> emit the active server's chat set.
+    fn list_chats(&self) -> Result<()> {
+        match self.active_vault() {
+            Some((server, vault, _)) => {
+                self.events.emit(vault::build_chats_event(&vault, &server)?);
+            }
+            None => self.events.emit(err_event("not_connected", "no active server")),
+        }
+        Ok(())
+    }
+
+    /// `history` -> emit a chat's recent messages from the active vault.
+    fn history(&self, chat: &str, limit: i64) -> Result<()> {
+        match self.active_vault() {
+            Some((_server, vault, _)) => self.emit_history(&vault, chat, limit),
+            None => {
+                self.events.emit(err_event("not_connected", "no active server"));
+                Ok(())
+            }
+        }
+    }
+
+    /// `quit` -> flush queued events, then exit.
     async fn quit(&mut self) -> Result<()> {
         self.events.shutdown().await;
         std::process::exit(0);
@@ -590,16 +839,41 @@ impl App {
 
     // -- helpers ------------------------------------------------------------
 
-    /// Emit the current chat set so the TUI sidebar updates.
-    fn emit_chats(&self) -> Result<()> {
-        self.events.emit(db::build_chats_event(&self.db)?);
-        Ok(())
+    /// Emit the initial `ready` event (the server list + master-key presence).
+    fn emit_ready(&self) {
+        self.events.emit(json!({
+            "event": "ready",
+            "servers": self.servers_value(),
+            "has_master": true,
+        }));
     }
 
-    /// Emit the last `limit` messages of a chat in chronological order.
-    fn emit_history(&self, chat: &str, limit: i64) -> Result<()> {
-        let rows = db::get_messages(&self.db, chat, limit)?;
-        let messages: Vec<serde_json::Value> = rows
+    /// Emit the `servers` event.
+    fn emit_servers(&self) {
+        self.events
+            .emit(json!({"event": "servers", "servers": self.servers_value()}));
+    }
+
+    /// Build the per-server descriptors for `ready`/`servers`.
+    fn servers_value(&self) -> Vec<Value> {
+        self.index
+            .servers
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": cherm_crypto::server_id(&r.addr),
+                    "addr": r.addr,
+                    "tier": r.tier.clone(),
+                    "verdict": r.verdict.clone(),
+                    "username": r.username.clone(),
+                    "active": self.active.as_deref() == Some(r.addr.as_str()),
+                })
+            })
+            .collect()
+    }
+
+    fn emit_history(&self, vault: &Vault, chat: &str, limit: i64) -> Result<()> {
+        let messages: Vec<Value> = vault::get_messages(vault, chat, limit)?
             .into_iter()
             .map(|(sender, body, ts, outgoing)| {
                 json!({"from": sender, "text": body, "ts": ts, "outgoing": outgoing != 0})
@@ -610,60 +884,82 @@ impl App {
         Ok(())
     }
 
-    /// Return a peer's base64 dh_pub, looking it up on the server (and caching
-    /// the result as a contact) when we don't already have it.
-    async fn resolve_dh(&self, link: &ServerLink, username: &str) -> Result<Resolved> {
-        if let Some(dh) = db::get_contact_dh(&self.db, username)? {
-            return Ok(Resolved::Found(dh));
+    /// Ensure a [`Server`] (vault opened, dir created, index recorded) exists.
+    fn ensure_server(&mut self, addr: &str) -> Result<()> {
+        if !self.servers.contains_key(addr) {
+            let id = cherm_crypto::server_id(addr);
+            let vault_key = cherm_crypto::derive_vault_key(&self.master, &id);
+            let dir = self.home.join("servers").join(&id);
+            std::fs::create_dir_all(&dir)?;
+            let conn = vault::open_vault(&dir.join("vault.db"), &vault_key)?;
+            self.servers.insert(
+                addr.to_string(),
+                Server {
+                    vault: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+                    vault_key,
+                    link: None,
+                    reader: None,
+                },
+            );
+            self.index.ensure(addr);
+            self.save_index()?;
         }
-        let reply = net::send_and_wait(link, ClientMsg::Lookup { username: username.to_string() }).await?;
-        match reply {
-            ServerMsg::UserInfo { username: u, uuid, ed_pub, dh_pub } => {
-                db::upsert_contact(&self.db, &u, &uuid, &ed_pub, &dh_pub)?;
-                Ok(Resolved::Found(dh_pub))
-            }
-            ServerMsg::Error { code, message } => Ok(Resolved::Err(code, message)),
-            other => Ok(Resolved::Err(
-                "internal".to_string(),
-                format!("unexpected lookup reply: {other:?}"),
-            )),
-        }
-    }
-
-    /// Drop a connection that has already died. The reader task finishes only
-    /// when the socket is closed (read error) or it was aborted, so once it is
-    /// finished the link is unusable: clear it so later commands don't try to
-    /// send over a broken connection. The reader already emitted `disconnected`.
-    fn prune_dead_link(&mut self) {
-        let dead = self.reader.as_ref().map(|h| h.is_finished()).unwrap_or(false);
-        if dead {
-            self.teardown_link();
-        }
-    }
-
-    /// Tear down the live connection: abort the reader and drop the link (which
-    /// closes the writer task).
-    fn teardown_link(&mut self) {
-        if let Some(handle) = self.reader.take() {
-            handle.abort();
-        }
-        self.link = None;
-    }
-
-    /// Path to the on-disk identity file.
-    fn identity_path(&self) -> PathBuf {
-        self.home.join("identity.json")
-    }
-
-    /// Persist an identity to `identity.json` with `0600` permissions.
-    fn save_identity(&self, id: &Identity) -> Result<()> {
-        let path = self.identity_path();
-        std::fs::write(&path, id.to_json()?)?;
-        let mut perms = std::fs::metadata(&path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms)?;
         Ok(())
     }
+
+    /// Cloned `(vault, vault_key)` for a server that has been `ensure_server`d.
+    fn vault_of(&self, addr: &str) -> (Vault, [u8; 32]) {
+        let s = self.servers.get(addr).expect("server must be ensured");
+        (s.vault.clone(), s.vault_key)
+    }
+
+    /// `(active_addr, vault, vault_key)` for the active server, if any.
+    fn active_vault(&self) -> Option<(String, Vault, [u8; 32])> {
+        let addr = self.active.clone()?;
+        let s = self.servers.get(&addr)?;
+        Some((addr, s.vault.clone(), s.vault_key))
+    }
+
+    /// A clone of the active server's live link, if connected.
+    fn active_link(&self) -> Option<ServerLink> {
+        let addr = self.active.as_ref()?;
+        self.servers.get(addr)?.link.clone()
+    }
+
+    /// Drop any connection whose reader task has finished (server disconnected).
+    fn prune_dead_links(&mut self) {
+        for s in self.servers.values_mut() {
+            let dead = s.reader.as_ref().map(|h| h.is_finished()).unwrap_or(false);
+            if dead {
+                s.reader = None;
+                s.link = None;
+            }
+        }
+    }
+
+    /// Tear down a server's live connection (abort the reader, drop the link).
+    fn teardown_link(&mut self, addr: &str) {
+        if let Some(s) = self.servers.get_mut(addr) {
+            if let Some(h) = s.reader.take() {
+                h.abort();
+            }
+            s.link = None;
+        }
+    }
+
+    /// Persist the server index to `~/.cherm/servers.json`.
+    fn save_index(&self) -> Result<()> {
+        let path = self.home.join("servers.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&self.index)?)?;
+        Ok(())
+    }
+}
+
+/// Map vodozemac one-time keys into the wire `OneTimeKey` shape.
+fn to_otks(otks: Vec<(String, String)>) -> Vec<OneTimeKey> {
+    otks.into_iter()
+        .map(|(key_id, curve25519)| OneTimeKey { key_id, curve25519 })
+        .collect()
 }
 
 /// Best-effort device fingerprint (the machine's hostname).

@@ -1,46 +1,49 @@
-//! IPC bridge between the Go TUI and this core (PROTOCOL.md section 4).
+//! IPC bridge between the Go TUI and this core (PROTOCOL.md section 4) — v2,
+//! multi-server.
 //!
-//! The TUI spawns `cherm-core` and speaks newline-delimited JSON:
 //! - commands arrive on our **stdin** (one JSON object per line),
 //! - events go out on our **stdout** (one JSON object per line),
 //! - logs go to **stderr** (handled by `tracing`).
 //!
 //! CRITICAL: every stdout write is funneled through a single mpsc channel into
 //! one writer task ([`writer_task`]). That guarantees event lines can never
-//! interleave even when multiple tasks (command handlers + the server reader)
-//! emit concurrently.
+//! interleave even when multiple tasks (command handlers + each server's
+//! processor) emit concurrently.
 
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
-/// Commands received from the TUI on stdin. The `cmd` field is the tag and the
-/// variant names map to the snake_case command strings in the protocol.
+/// Commands received from the TUI on stdin. The `cmd` field is the tag.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    /// `{"cmd":"status"}`
-    Status,
-    /// `{"cmd":"register","username":"alice","server":"127.0.0.1:9000"}`
-    Register { username: String, server: String },
-    /// `{"cmd":"connect","server":"127.0.0.1:9000"}`
+    /// `{"cmd":"list_servers"}`
+    ListServers,
+    /// `{"cmd":"check_server","server":"host:port"}`
+    CheckServer { server: String },
+    /// `{"cmd":"connect","server":"host:port"}`
     Connect { server: String },
+    /// `{"cmd":"register","server":"host:port","username":"alice"}`
+    Register { server: String, username: String },
+    /// `{"cmd":"switch_server","server":"host:port"}`
+    SwitchServer { server: String },
     /// `{"cmd":"list_chats"}`
     ListChats,
-    /// `{"cmd":"start_dm","username":"bob"}`
-    StartDm { username: String },
-    /// `{"cmd":"create_group","name":"devs","members":["bob","carol"]}`
-    CreateGroup { name: String, members: Vec<String> },
     /// `{"cmd":"history","chat":"bob","limit":200}`
     History {
         chat: String,
         #[serde(default)]
         limit: Option<i64>,
     },
+    /// `{"cmd":"start_dm","username":"bob"}`
+    StartDm { username: String },
+    /// `{"cmd":"create_group","name":"devs","members":["bob","carol"]}`
+    CreateGroup { name: String, members: Vec<String> },
     /// `{"cmd":"send","chat":"bob","text":"hi"}`
     Send { chat: String, text: String },
-    /// `{"cmd":"ping"}` -> measure round-trip latency to the server.
+    /// `{"cmd":"ping"}`
     Ping,
     /// `{"cmd":"quit"}`
     Quit,
@@ -66,14 +69,12 @@ impl Events {
         Events { tx }
     }
 
-    /// Queue one event line for writing. Best-effort: if the writer is gone we
-    /// silently drop (the process is shutting down).
+    /// Queue one event line. Best-effort: if the writer is gone we drop silently.
     pub fn emit(&self, value: Value) {
         let _ = self.tx.send(Out::Line(value));
     }
 
-    /// Flush all previously-queued lines, then stop the writer. Resolves once
-    /// the writer confirms it has flushed and exited.
+    /// Flush all queued lines, then stop the writer. Resolves once flushed.
     pub async fn shutdown(&self) {
         let (done_tx, done_rx) = oneshot::channel();
         if self.tx.send(Out::Shutdown(done_tx)).is_ok() {
@@ -87,9 +88,8 @@ pub fn err_event(code: &str, message: &str) -> Value {
     serde_json::json!({"event": "error", "code": code, "message": message})
 }
 
-/// The single stdout writer task. Drains the channel in order, writing one
-/// JSON object per line and flushing after each so the TUI sees events
-/// promptly.
+/// The single stdout writer task. Drains the channel in order, one JSON object
+/// per line, flushing after each so the TUI sees events promptly.
 pub async fn writer_task(mut rx: mpsc::UnboundedReceiver<Out>) {
     let mut out = tokio::io::stdout();
     while let Some(item) = rx.recv().await {

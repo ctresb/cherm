@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -14,14 +15,20 @@ import (
 type screen int
 
 const (
-	screenOnboard screen = iota // username registration
-	screenChat                  // sidebar + messages + input
-	screenMenu                  // server / ping / change-server / docs
-	screenHelp                  // command + key reference
+	screenServers   screen = iota // home: list of known servers + verdict badges
+	screenAddServer               // textinput host:port -> check_server
+	screenVerdict                 // attestation verdict + Cancel/Connect buttons
+	screenUsername                // username registration on a server
+	screenChat                    // sidebar + messages + input
+	screenMenu                    // server / ping / change-server / docs
+	screenHelp                    // command + key reference
 )
 
 // menuItemCount is the number of selectable rows on the menu screen.
 const menuItemCount = 5
+
+// redCountdownSecs is how long "Connect anyway" stays disabled on a red verdict.
+const redCountdownSecs = 10
 
 const defaultDocs = "https://cherm.chat/docs"
 
@@ -42,9 +49,20 @@ type chatState struct {
 	activity bool // unread activity while another chat is open
 }
 
+// verdictTickMsg drives the 1-second "Connect anyway" countdown on red verdicts.
+type verdictTickMsg struct{}
+
+// verdictTick schedules one countdown tick a second from now.
+func verdictTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return verdictTickMsg{} })
+}
+
 // Model is the bubbletea model for the whole TUI.
 type Model struct {
-	core       *Core
+	core *Core
+
+	// the active server's address (display + chat scope) and the default to
+	// offer when adding a server.
 	serverAddr string
 
 	// window + layout
@@ -53,34 +71,46 @@ type Model struct {
 	contentH      int
 
 	// top-level state
-	ready  bool
-	screen screen
-	focus  focusArea
+	ready     bool
+	hasMaster bool
+	screen    screen
+	focus     focusArea
 
 	// identity / connection state mirrored from core events
-	username   string
-	uuid       string
-	registered bool
-	connected  bool
+	username  string
+	uuid      string
+	connected bool
 
-	// onboarding
-	nameInput  textinput.Model
-	onboardErr string
+	// servers home
+	servers   []ServerInfo
+	serverSel int
+
+	// add-server / username flow
+	serverInput   textinput.Model // host:port editor (add server)
+	checking      bool            // a check_server is in flight
+	pendingServer string          // server awaiting a username (need_username)
+	nameInput     textinput.Model // username editor
+	onboardErr    string
+
+	// verdict screen
+	verdict          attestMsg
+	verdictSel       int  // 0 = Cancel, 1 = Connect / Connect anyway
+	verdictCountdown int  // seconds remaining before "Connect anyway" enables
+	verdictTicking   bool // a countdown tick chain is currently live
 
 	// chat screen
-	input      textinput.Model
-	viewport   viewport.Model
-	chats      []*chatState
-	chatByID   map[string]*chatState
-	sidebarSel int
-	current    string // id of the open chat
+	input        textinput.Model
+	viewport     viewport.Model
+	chats        []*chatState
+	chatByID     map[string]*chatState
+	sidebarSel   int
+	current      string            // id of the open chat
+	fingerprints map[string]string // peer username -> safety number
 
 	// menu screen
-	menuSel     int
-	menuEditing bool            // editing the server address field
-	serverInput textinput.Model // server address editor
-	pingMs      int64           // last measured latency, -1 if unknown
-	docsURL     string
+	menuSel int
+	pingMs  int64 // last measured latency, -1 if unknown
+	docsURL string
 
 	// transient footer status
 	status  string
@@ -96,7 +126,6 @@ func NewModel(core *Core) Model {
 	name.CharLimit = 16
 	name.Width = 24
 	name.Prompt = "> "
-	name.Focus()
 
 	in := textinput.New()
 	in.Placeholder = "type a message or /command"
@@ -121,18 +150,19 @@ func NewModel(core *Core) Model {
 	srv.Width = 32
 
 	return Model{
-		core:        core,
-		serverAddr:  server,
-		screen:      screenOnboard,
-		focus:       focusInput,
-		nameInput:   name,
-		input:       in,
-		serverInput: srv,
-		viewport:    viewport.New(40, 10),
-		chatByID:    map[string]*chatState{},
-		pingMs:      -1,
-		docsURL:     docs,
-		status:      "starting cherm-core...",
+		core:         core,
+		serverAddr:   server,
+		screen:       screenServers,
+		focus:        focusInput,
+		nameInput:    name,
+		input:        in,
+		serverInput:  srv,
+		viewport:     viewport.New(40, 10),
+		chatByID:     map[string]*chatState{},
+		fingerprints: map[string]string{},
+		pingMs:       -1,
+		docsURL:      docs,
+		status:       "starting cherm-core...",
 	}
 }
 
@@ -176,8 +206,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.quitCmd()
 		}
 		switch m.screen {
-		case screenOnboard:
-			return m.updateOnboard(msg)
+		case screenServers:
+			return m.updateServers(msg)
+		case screenAddServer:
+			return m.updateAddServer(msg)
+		case screenVerdict:
+			return m.updateVerdict(msg)
+		case screenUsername:
+			return m.updateUsername(msg)
 		case screenMenu:
 			return m.updateMenu(msg)
 		case screenHelp:
@@ -189,27 +225,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ---- core events ----
 	case readyMsg:
 		return m.onReady(msg)
-	case statusMsg:
-		m.connected = msg.connected
-		m.registered = msg.registered
-		if msg.username != "" {
-			m.username = msg.username
-		}
-		return m, nil
+	case serversMsg:
+		return m.onServers(msg)
+	case attestMsg:
+		return m.onAttest(msg)
+	case needUsernameMsg:
+		return m.onNeedUsername(msg)
 	case registeredMsg:
-		m.username = msg.username
-		m.uuid = msg.uuid
-		m.registered = true
-		m.connected = true
-		return m.enterChat(), m.afterEnterCmd()
+		return m.onRegistered(msg)
 	case connectedMsg:
-		m.username = msg.username
-		m.uuid = msg.uuid
-		m.connected = true
-		m.flash(fmt.Sprintf("connected as %s", msg.username), false)
-		return m.enterChat(), m.afterEnterCmd()
+		return m.onConnected(msg)
 	case disconnectedMsg:
-		m.connected = false
+		if msg.server == "" || msg.server == m.serverAddr {
+			m.connected = false
+		}
 		m.flash("disconnected: "+msg.reason, true)
 		return m, nil
 	case chatsMsg:
@@ -219,14 +248,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onHistory(msg)
 	case messageMsg:
 		return m.onMessage(msg)
+	case fingerprintMsg:
+		m.fingerprints[msg.username] = msg.fingerprint
+		m.flash(fmt.Sprintf("safety number for %s: %s", msg.username, msg.fingerprint), false)
+		return m, nil
+	case verdictTickMsg:
+		if m.screen == screenVerdict && m.verdictCountdown > 0 {
+			m.verdictCountdown--
+			if m.verdictCountdown > 0 {
+				return m, verdictTick()
+			}
+		}
+		// Either the countdown reached zero or we left the verdict screen: this
+		// chain stops here, so clear the flag to let a future red verdict start a
+		// fresh one. (tea.Tick chains cannot be cancelled, so we must never run
+		// two at once — that would drain the safety countdown at 2x+ speed.)
+		m.verdictTicking = false
+		return m, nil
 	case errorMsg:
 		txt := msg.message
 		if msg.code != "" {
 			txt = fmt.Sprintf("%s (%s)", msg.message, msg.code)
 		}
 		m.flash("error: "+txt, true)
-		// During onboarding, surface registration errors inline too.
-		if m.screen == screenOnboard {
+		m.checking = false
+		// During username registration, surface errors inline too.
+		if m.screen == screenUsername {
 			m.onboardErr = txt
 		}
 		return m, nil
@@ -244,27 +291,108 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// onReady handles the one-time startup "ready" event: branch to onboarding or,
-// if an identity already exists, connect and show the chat screen.
+// onReady handles the one-time startup "ready" event: with no known servers go
+// straight to add-server, otherwise show the servers home screen.
 func (m Model) onReady(msg readyMsg) (tea.Model, tea.Cmd) {
 	m.ready = true
-	m.registered = msg.registered
-	m.username = msg.username
+	m.hasMaster = msg.hasMaster
+	m.servers = msg.servers
 
-	if !msg.registered {
-		m.screen = screenOnboard
-		m.focus = focusInput
-		m.status = "register a username to begin"
-		m.nameInput.Focus()
-		return m, textinput.Blink
+	if len(m.servers) == 0 {
+		return m.openAddServer()
 	}
+	m.screen = screenServers
+	m.serverSel = 0
+	m.status = "select a server to connect"
+	return m, textinput.Blink
+}
 
-	// Existing identity: authenticate, then show the chat screen.
-	m2 := m.enterChat()
-	return m2, tea.Batch(
-		m.cmdSend(map[string]any{"cmd": "connect", "server": m.serverAddr}),
-		textinput.Blink,
-	)
+// onServers refreshes the known-servers list and keeps the selection in range.
+func (m Model) onServers(msg serversMsg) (tea.Model, tea.Cmd) {
+	m.servers = msg.servers
+	if m.serverSel >= len(m.servers) {
+		m.serverSel = len(m.servers) - 1
+	}
+	if m.serverSel < 0 {
+		m.serverSel = 0
+	}
+	for _, s := range m.servers {
+		if s.Active {
+			m.serverAddr = s.Addr
+			if s.Username != "" {
+				m.username = s.Username
+			}
+		}
+	}
+	return m, nil
+}
+
+// onAttest shows the verdict screen for a freshly-checked server, starting the
+// 10-second countdown when the verdict is red.
+func (m Model) onAttest(msg attestMsg) (tea.Model, tea.Cmd) {
+	m.verdict = msg
+	m.checking = false
+	m.screen = screenVerdict
+	if msg.verdict == "red" {
+		m.verdictSel = 0 // default to Cancel; Connect anyway is disabled
+		m.verdictCountdown = redCountdownSecs
+		if m.verdictTicking {
+			// A previous countdown chain is still alive (e.g. the user cancelled
+			// a red verdict and re-checked another within a second). Reuse it
+			// rather than starting a second concurrent chain.
+			return m, nil
+		}
+		m.verdictTicking = true
+		return m, verdictTick()
+	}
+	m.verdictSel = 1 // default to Connect for green/yellow
+	m.verdictCountdown = 0
+	return m, nil
+}
+
+// onNeedUsername opens the username registration screen for a server.
+func (m Model) onNeedUsername(msg needUsernameMsg) (tea.Model, tea.Cmd) {
+	m.pendingServer = msg.server
+	m.checking = false
+	m.screen = screenUsername
+	m.onboardErr = ""
+	m.nameInput.SetValue("")
+	m.nameInput.Focus()
+	m.flash("create a username for "+msg.server, false)
+	return m, textinput.Blink
+}
+
+// onRegistered records a new identity and enters the chat screen.
+func (m Model) onRegistered(msg registeredMsg) (tea.Model, tea.Cmd) {
+	if msg.server != "" && msg.server != m.serverAddr {
+		m.resetChats()
+		m.serverAddr = msg.server
+	}
+	m.username = msg.username
+	m.uuid = msg.uuid
+	m.connected = true
+	m.checking = false
+	m.flash(fmt.Sprintf("registered as %s on %s", msg.username, m.serverAddr), false)
+	return m.enterChat(), m.afterEnterCmd()
+}
+
+// onConnected makes a server active and enters the chat screen.
+func (m Model) onConnected(msg connectedMsg) (tea.Model, tea.Cmd) {
+	if msg.server != "" && msg.server != m.serverAddr {
+		m.resetChats()
+		m.serverAddr = msg.server
+	}
+	if msg.username != "" {
+		m.username = msg.username
+	}
+	m.connected = true
+	m.checking = false
+	who := m.username
+	if who == "" {
+		who = "-"
+	}
+	m.flash(fmt.Sprintf("connected to %s as %s", m.serverAddr, who), false)
+	return m.enterChat(), m.afterEnterCmd()
 }
 
 // enterChat switches to the chat screen and focuses the input box.
@@ -273,6 +401,7 @@ func (m Model) enterChat() Model {
 	m.focus = focusInput
 	m.input.Focus()
 	m.nameInput.Blur()
+	m.serverInput.Blur()
 	m.onboardErr = ""
 	m.layout()
 	return m
@@ -283,10 +412,158 @@ func (m Model) afterEnterCmd() tea.Cmd {
 	return m.cmdSend(map[string]any{"cmd": "list_chats"})
 }
 
-// ---- onboarding ----
+// resetChats clears the per-server chat cache when the active server changes.
+func (m *Model) resetChats() {
+	m.chats = nil
+	m.chatByID = map[string]*chatState{}
+	m.current = ""
+	m.sidebarSel = 0
+	m.viewport.SetContent("")
+}
 
-func (m Model) updateOnboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// ---- servers home ----
+
+func (m Model) updateServers(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "up", "k":
+		if m.serverSel > 0 {
+			m.serverSel--
+		}
+		return m, nil
+	case "down", "j":
+		if m.serverSel < len(m.servers)-1 {
+			m.serverSel++
+		}
+		return m, nil
+	case "a":
+		return m.openAddServer()
+	case "enter":
+		return m.connectSelected()
+	case "esc":
+		if m.connected {
+			return m.enterChat(), textinput.Blink
+		}
+		return m, nil
+	case "q":
+		return m, m.quitCmd()
+	}
+	return m, nil
+}
+
+// connectSelected connects to the highlighted server, or just opens the chat
+// screen if that server is already the active, connected one.
+func (m Model) connectSelected() (tea.Model, tea.Cmd) {
+	if m.serverSel < 0 || m.serverSel >= len(m.servers) {
+		return m, nil
+	}
+	s := m.servers[m.serverSel]
+	if s.Active && m.connected {
+		m.serverAddr = s.Addr
+		return m.enterChat(), textinput.Blink
+	}
+	m.flash("connecting to "+s.Addr+"...", false)
+	return m, m.cmdSend(map[string]any{"cmd": "connect", "server": s.Addr})
+}
+
+// openAddServer switches to the add-server screen, prefilled with the default
+// server address for convenience.
+func (m Model) openAddServer() (tea.Model, tea.Cmd) {
+	m.screen = screenAddServer
+	m.checking = false
+	m.serverInput.SetValue(m.serverAddr)
+	m.serverInput.Focus()
+	m.serverInput.CursorEnd()
+	m.flash("", false)
+	return m, textinput.Blink
+}
+
+// ---- add server ----
+
+func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.serverInput.Blur()
+		m.screen = screenServers
+		return m, nil
+	case "enter":
+		addr := strings.TrimSpace(m.serverInput.Value())
+		if addr == "" {
+			m.flash("server address cannot be empty", true)
+			return m, nil
+		}
+		m.checking = true
+		m.flash("checking "+addr+"...", false)
+		return m, m.cmdSend(map[string]any{"cmd": "check_server", "server": addr})
+	}
+	var cmd tea.Cmd
+	m.serverInput, cmd = m.serverInput.Update(msg)
+	return m, cmd
+}
+
+// ---- verdict ----
+
+func (m Model) updateVerdict(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "h", "shift+tab":
+		m.verdictSel = 0
+		return m, nil
+	case "right", "l", "tab":
+		m.verdictSel = 1
+		return m, nil
+	case "o":
+		return m.openVerdictLink()
+	case "esc":
+		m.screen = screenServers
+		return m, nil
+	case "enter":
+		return m.activateVerdict()
+	}
+	return m, nil
+}
+
+// activateVerdict runs the focused verdict button.
+func (m Model) activateVerdict() (tea.Model, tea.Cmd) {
+	if m.verdictSel == 0 { // Cancel
+		m.screen = screenServers
+		return m, nil
+	}
+	// Connect / Connect anyway.
+	if m.verdict.verdict == "red" && m.verdictCountdown > 0 {
+		m.flash(fmt.Sprintf("wait %ds before connecting anyway", m.verdictCountdown), true)
+		return m, nil
+	}
+	addr := m.verdict.server
+	m.flash("connecting to "+addr+"...", false)
+	return m, m.cmdSend(map[string]any{"cmd": "connect", "server": addr})
+}
+
+// openVerdictLink opens the verdict's relevant link: the public codebase for a
+// red verdict, otherwise the signatures explainer.
+func (m Model) openVerdictLink() (tea.Model, tea.Cmd) {
+	url := m.verdict.signaturesURL
+	if m.verdict.verdict == "red" {
+		url = m.verdict.publicCodebaseURL
+	}
+	if url == "" {
+		m.flash("no link available", true)
+		return m, nil
+	}
+	if err := openBrowser(url); err != nil {
+		m.flash("could not open browser: "+err.Error(), true)
+	} else {
+		m.flash("opened "+url, false)
+	}
+	return m, nil
+}
+
+// ---- username registration ----
+
+func (m Model) updateUsername(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.nameInput.Blur()
+		m.screen = screenServers
+		return m, nil
 	case "enter":
 		u := strings.TrimSpace(m.nameInput.Value())
 		if !validUsername(u) {
@@ -294,14 +571,13 @@ func (m Model) updateOnboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.onboardErr = ""
-		m.status = "registering " + u + "..."
+		m.flash("registering "+u+"...", false)
 		return m, m.cmdSend(map[string]any{
 			"cmd":      "register",
+			"server":   m.pendingServer,
 			"username": u,
-			"server":   m.serverAddr,
 		})
 	}
-
 	var cmd tea.Cmd
 	m.nameInput, cmd = m.nameInput.Update(msg)
 	return m, cmd
@@ -438,6 +714,9 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 			"members": args[1:],
 		})
 
+	case "/servers":
+		return m.openServersScreen()
+
 	case "/menu":
 		return m.openMenu()
 
@@ -458,48 +737,34 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 func (m Model) openMenu() (tea.Model, tea.Cmd) {
 	m.screen = screenMenu
 	m.menuSel = 0
-	m.menuEditing = false
 	m.input.Blur()
 	m.serverInput.Blur()
 	return m, m.cmdSend(map[string]any{"cmd": "ping"})
+}
+
+// openServersScreen switches to the servers home, selecting the active server.
+func (m Model) openServersScreen() (tea.Model, tea.Cmd) {
+	m.screen = screenServers
+	m.input.Blur()
+	m.serverSel = 0
+	for i, s := range m.servers {
+		if s.Addr == m.serverAddr {
+			m.serverSel = i
+		}
+	}
+	return m, m.cmdSend(map[string]any{"cmd": "list_servers"})
 }
 
 // backToChat returns to the chat screen with the input focused.
 func (m Model) backToChat() (tea.Model, tea.Cmd) {
 	m.screen = screenChat
 	m.focus = focusInput
-	m.menuEditing = false
 	m.serverInput.Blur()
 	m.input.Focus()
 	return m, textinput.Blink
 }
 
 func (m Model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Editing the server address field.
-	if m.menuEditing {
-		switch msg.String() {
-		case "enter":
-			val := strings.TrimSpace(m.serverInput.Value())
-			if val == "" {
-				m.flash("server address cannot be empty", true)
-				return m, nil
-			}
-			m.serverAddr = val
-			m.menuEditing = false
-			m.serverInput.Blur()
-			m.pingMs = -1
-			m.flash("connecting to "+val+"...", false)
-			return m, m.cmdSend(map[string]any{"cmd": "connect", "server": val})
-		case "esc":
-			m.menuEditing = false
-			m.serverInput.Blur()
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.serverInput, cmd = m.serverInput.Update(msg)
-		return m, cmd
-	}
-
 	switch msg.String() {
 	case "esc", "q":
 		return m.backToChat()
@@ -524,12 +789,8 @@ func (m Model) updateMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // activateMenu runs the currently highlighted menu item.
 func (m Model) activateMenu() (tea.Model, tea.Cmd) {
 	switch m.menuSel {
-	case 0: // Change server
-		m.menuEditing = true
-		m.serverInput.SetValue(m.serverAddr)
-		m.serverInput.Focus()
-		m.serverInput.CursorEnd()
-		return m, textinput.Blink
+	case 0: // Change server -> servers home
+		return m.openServersScreen()
 	case 1: // Refresh ping
 		return m, m.cmdSend(map[string]any{"cmd": "ping"})
 	case 2: // Help
@@ -552,7 +813,11 @@ func (m Model) activateMenu() (tea.Model, tea.Cmd) {
 func (m Model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "enter", "q":
-		return m.backToChat()
+		if m.connected {
+			return m.backToChat()
+		}
+		m.screen = screenServers
+		return m, nil
 	}
 	return m, nil
 }
@@ -663,6 +928,19 @@ func (m *Model) flash(text string, isErr bool) {
 	m.isError = isErr
 }
 
+// currentFingerprint returns the safety number of the open DM's peer, if known.
+func (m Model) currentFingerprint() string {
+	cs := m.chatByID[m.current]
+	if cs == nil || cs.info.Kind != "dm" {
+		return ""
+	}
+	peer := cs.info.Title
+	if peer == "" {
+		peer = cs.info.ID
+	}
+	return m.fingerprints[peer]
+}
+
 // layout recomputes widget dimensions from the current window size. Borders add
 // 2 to a box's total width/height, so inner content sizes are total - 2.
 func (m *Model) layout() {
@@ -716,8 +994,14 @@ func (m Model) View() string {
 		return lipgloss.NewStyle().Padding(1, 2).Render(m.status)
 	}
 	switch m.screen {
-	case screenOnboard:
-		return m.onboardView()
+	case screenServers:
+		return m.serversView()
+	case screenAddServer:
+		return m.addServerView()
+	case screenVerdict:
+		return m.verdictView()
+	case screenUsername:
+		return m.usernameView()
 	case screenMenu:
 		return m.menuView()
 	case screenHelp:
