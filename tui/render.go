@@ -41,7 +41,10 @@ var (
 // system marks a "✣ System" event (e.g. a "left the chat" notice): the label
 // becomes "✣ System" and the prefix is accented so it reads as a system line,
 // never confusable with a normal user message.
-func renderMessage(label string, ts int64, body, color string, system bool) string {
+// width is the wrap width (the viewport's inner width); <=0 disables wrapping.
+// outgoing marks the user's own messages, which get a subtle background band so
+// they read differently from incoming ones.
+func renderMessage(label string, ts int64, body, color string, system, outgoing bool, width int) string {
 	if system {
 		label = "✣ System"
 	}
@@ -58,12 +61,23 @@ func renderMessage(label string, ts int64, body, color string, system bool) stri
 		ps = ps.Foreground(c)
 		bs = bs.Foreground(c)
 	}
-	return ps.Render(prefix) + bs.Render(body)
+	line := ps.Render(prefix) + bs.Render(body)
+
+	// Wrap to the viewport width so long messages break onto multiple lines
+	// instead of overflowing, and give outgoing messages a subtle background.
+	box := lipgloss.NewStyle()
+	if width > 0 {
+		box = box.Width(width)
+	}
+	if outgoing && !system {
+		box = box.Background(cOutgoingBg)
+	}
+	return box.Render(line)
 }
 
 // renderMessages renders an ordered slice of messages into a single string,
-// one bubble per line, ready to drop into the viewport.
-func renderMessages(msgs []Message) string {
+// wrapped to `width`, ready to drop into the viewport.
+func renderMessages(msgs []Message, width int) string {
 	if len(msgs) == 0 {
 		return ""
 	}
@@ -73,7 +87,7 @@ func renderMessages(msgs []Message) string {
 		if m.Outgoing {
 			label = "you"
 		}
-		lines = append(lines, renderMessage(label, m.Ts, m.Text, m.Color, m.System))
+		lines = append(lines, renderMessage(label, m.Ts, m.Text, m.Color, m.System, m.Outgoing, width))
 	}
 	return strings.Join(lines, "\n")
 }

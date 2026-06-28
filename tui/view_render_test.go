@@ -227,7 +227,7 @@ func TestBubbleStaysWhiteAndBold(t *testing.T) {
 	defer lipgloss.SetColorProfile(termenv.ANSI)
 
 	// A system "left the chat" line renders as "✣ System", never as a user.
-	sys := renderMessage("alice", 1700000000000, "alice left the chat.", "", true)
+	sys := renderMessage("alice", 1700000000000, "alice left the chat.", "", true, false, 0)
 	if !strings.Contains(strip(sys), "✣ System") {
 		t.Error("system message must render as ✣ System")
 	}
@@ -235,7 +235,7 @@ func TestBubbleStaysWhiteAndBold(t *testing.T) {
 		t.Error("system message must carry the notice text")
 	}
 
-	out := renderMessage("you", 1700000000000, "secret", "", false)
+	out := renderMessage("you", 1700000000000, "secret", "", false, true, 0)
 	if !strings.Contains(out, "\x1b[1m") {
 		t.Error("bubble prefix should be bold")
 	}

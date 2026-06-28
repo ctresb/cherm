@@ -41,6 +41,10 @@ var (
 	cYellow  lipgloss.Color
 	cRed     lipgloss.Color
 
+	// cOutgoingBg is a subtle, theme-derived background band for the user's own
+	// messages, so they read differently from incoming ones (text stays white).
+	cOutgoingBg lipgloss.Color
+
 	// colorAccent is the primary accent (focused borders, selections).
 	colorAccent lipgloss.Color
 )
@@ -146,6 +150,17 @@ func applyPalette(p Palette) {
 	badgeUnaudited = lipgloss.NewStyle().Foreground(cWhite).Background(cRed).Bold(true).Padding(0, 1)
 	badgeWidgetText = lipgloss.NewStyle().Foreground(cMuted)
 	lockStyle = lipgloss.NewStyle().Bold(true).Foreground(cYellow)
+
+	// Subtle outgoing-message band: the base dark nudged toward the accent, so
+	// the user's own lines read differently without coloring the (white) text.
+	cOutgoingBg = lipgloss.Color(blendHex(p.Dark, p.Magenta, 0.16))
+}
+
+// blendHex linearly interpolates two #RRGGBB colors (t in [0,1]).
+func blendHex(a, b string, t float64) string {
+	ar, ag, ab := hexToRGB(a)
+	br, bg, bb := hexToRGB(b)
+	return fmt.Sprintf("#%02X%02X%02X", lerp(ar, br, t), lerp(ag, bg, t), lerp(ab, bb, t))
 }
 
 // boxStyle returns a rounded-border box whose border color reflects focus.

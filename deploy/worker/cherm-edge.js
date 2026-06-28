@@ -85,10 +85,12 @@ async function handlePlugins(request, env, url) {
 }
 
 async function handleSubmit(request, env) {
-  if (env.SUBMIT_TOKEN) {
-    const tok = request.headers.get("x-cherm-submit-token");
-    if (tok !== env.SUBMIT_TOKEN) return json({ error: "unauthorized" }, 401);
-  }
+  // Admin token: when configured it gates ALL submissions; possessing it also
+  // authorizes updating an existing plugin. Without it, submissions are open but
+  // may only CREATE new names (never overwrite — see the collision check below).
+  const hasToken = !!env.SUBMIT_TOKEN &&
+    request.headers.get("x-cherm-submit-token") === env.SUBMIT_TOKEN;
+  if (env.SUBMIT_TOKEN && !hasToken) return json({ error: "unauthorized" }, 401);
 
   let body;
   try {
@@ -111,6 +113,20 @@ async function handleSubmit(request, env) {
     if (!ALLOWED_PERMISSIONS.has(String(p))) {
       return json({ error: `permission '${p}' is not allowed` }, 400);
     }
+  }
+
+  // Load the catalog FIRST and block name collisions: an open (no-token)
+  // submission must never overwrite an existing plugin — otherwise anyone could
+  // hijack `pastel-theme` (or any community plugin) by re-submitting its name.
+  // Only an authenticated admin may update an existing entry.
+  let index = { plugins: [] };
+  const idxObj = await env.PLUGINS.get("index");
+  if (idxObj) {
+    try { index = await idxObj.json(); } catch { index = { plugins: [] }; }
+  }
+  if (!Array.isArray(index.plugins)) index.plugins = [];
+  if (index.plugins.some((p) => p.name === name) && !hasToken) {
+    return json({ error: `plugin name '${name}' already exists — choose a unique name` }, 409);
   }
 
   // Canonical package bytes + integrity hash.
@@ -142,13 +158,8 @@ async function handleSubmit(request, env) {
   await env.PLUGINS.put(`${name}/releases/${clean.version}/manifest`, manifestBytes, ct);
   await env.PLUGINS.put(`${name}/releases/${clean.version}/package`, pkgBytes, ct);
 
-  // Update the catalog index (read-modify-write; submissions are low-volume).
-  let index = { plugins: [] };
-  const idxObj = await env.PLUGINS.get("index");
-  if (idxObj) {
-    try { index = await idxObj.json(); } catch { index = { plugins: [] }; }
-  }
-  if (!Array.isArray(index.plugins)) index.plugins = [];
+  // Update the catalog index (loaded above). An admin re-submit replaces the
+  // existing entry; an open submission only ever adds a new (unique) name.
   index.plugins = index.plugins.filter((p) => p.name !== name);
   index.plugins.push(clean);
   await env.PLUGINS.put("index", new TextEncoder().encode(JSON.stringify(index, null, 2)), ct);

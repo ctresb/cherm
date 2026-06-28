@@ -388,7 +388,16 @@ impl Plugins {
             .await
             .map_err(|e| anyhow!("read package: {e}"))?;
         let got = hex::encode(Sha256::digest(&bytes));
-        if !manifest.package_sha256.is_empty() && got != manifest.package_sha256 {
+        // A manifest with no checksum cannot be verified — refuse to install it
+        // rather than fall through (an empty hash must never bypass the check).
+        if manifest.package_sha256.is_empty() {
+            self.events.emit(json!({
+                "event": "error", "code": "verify_failed",
+                "message": format!("{name} has no package checksum — refusing to install an unverified plugin")
+            }));
+            return Ok(());
+        }
+        if got != manifest.package_sha256 {
             self.events.emit(json!({
                 "event": "error", "code": "verify_failed",
                 "message": format!("package checksum mismatch for {name} (expected {}, got {got})", manifest.package_sha256)

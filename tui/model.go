@@ -1257,7 +1257,7 @@ func (m *Model) refreshViewport() {
 		m.viewport.SetContent("")
 		return
 	}
-	m.viewport.SetContent(renderMessages(cs.messages))
+	m.viewport.SetContent(renderMessages(cs.messages, m.viewport.Width))
 	m.viewport.GotoBottom()
 }
 
@@ -1273,7 +1273,7 @@ func (m *Model) appendToViewport() {
 		return
 	}
 	atBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(renderMessages(cs.messages))
+	m.viewport.SetContent(renderMessages(cs.messages, m.viewport.Width))
 	if atBottom {
 		m.viewport.GotoBottom()
 	}

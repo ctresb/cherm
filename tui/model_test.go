@@ -238,7 +238,7 @@ func TestMessageAutoScrollStickiness(t *testing.T) {
 
 func TestRenderMessage(t *testing.T) {
 	// ts 0 -> epoch; just assert the structural prefix and body are present.
-	out := renderMessage("you", 0, "hello", "", false)
+	out := renderMessage("you", 0, "hello", "", false, true, 0)
 	if !contains(out, "[you][") || !contains(out, "]> ") || !contains(out, "hello") {
 		t.Fatalf("unexpected render: %q", out)
 	}
