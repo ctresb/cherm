@@ -33,9 +33,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use cherm_proto::{errcode, read_msg, valid_username, write_msg, ClientMsg, ServerMsg};
+use cherm_proto::{
+    errcode, is_reserved_username, read_msg, valid_username, write_msg, ClientMsg, ServerMsg,
+};
 
 use crate::attest;
+use crate::config;
 use crate::db;
 
 /// Map of currently-online username -> a channel to that connection's writer
@@ -175,6 +178,7 @@ pub async fn handle(
     online: Online,
     db: Db,
     attestor: attest::Shared,
+    config: config::Shared,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -194,6 +198,9 @@ pub async fn handle(
     // Per-connection authentication state.
     let mut authed: Option<String> = None; // Some(username) once logged in.
     let mut pending_nonce: Option<Vec<u8>> = None; // raw 32-byte challenge nonce.
+    // The client's announced build hash (from ClientHello), used for the
+    // official-client policy. A client can lie about this, so it is a deterrent.
+    let mut client_build_hash: Option<String> = None;
 
     loop {
         // Read the next frame as untyped JSON first. `read_msg` consumes exactly
@@ -235,6 +242,27 @@ pub async fn handle(
                 }
             }
 
+            // ---- Client announces its build (official-client policy) --------
+            ClientMsg::ClientHello {
+                build_hash,
+                client_version,
+            } => {
+                client_build_hash = Some(build_hash.clone());
+                debug!(%peer, client_version, "client hello");
+                let _ = tx.send(ServerMsg::Ok { detail: None });
+            }
+
+            // ---- Public server metadata (operator-supplied, pre-auth) -------
+            ClientMsg::GetServerInfo => {
+                let _ = tx.send(ServerMsg::ServerInfo {
+                    name: config.name.clone(),
+                    repo_url: config.repo_url.clone(),
+                    description: config.description.clone(),
+                    contact: config.contact.clone(),
+                    version: attestor.version().to_string(),
+                });
+            }
+
             // ---- Registration: create a brand-new immutable identity --------
             ClientMsg::Register {
                 username,
@@ -242,6 +270,22 @@ pub async fn handle(
                 curve25519,
                 machine_id,
             } => {
+                // Official-client policy: reject builds the operator doesn't trust.
+                if !config.client_allowed(client_build_hash.as_deref()) {
+                    let _ = tx.send(err(
+                        errcode::UNOFFICIAL_CLIENT,
+                        "this server only accepts the official client",
+                    ));
+                    continue;
+                }
+                // Reserved system/server identities can never be registered.
+                if is_reserved_username(&username) {
+                    let _ = tx.send(err(
+                        errcode::USERNAME_RESERVED,
+                        "that username is reserved for system use",
+                    ));
+                    continue;
+                }
                 if !valid_username(&username) {
                     let _ = tx.send(err(
                         errcode::USERNAME_INVALID,
@@ -300,6 +344,14 @@ pub async fn handle(
                 username,
                 signature,
             } => {
+                // Official-client policy also gates login, not just registration.
+                if !config.client_allowed(client_build_hash.as_deref()) {
+                    let _ = tx.send(err(
+                        errcode::UNOFFICIAL_CLIENT,
+                        "this server only accepts the official client",
+                    ));
+                    continue;
+                }
                 let nonce = match pending_nonce.take() {
                     Some(n) => n,
                     None => {

@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -26,6 +27,17 @@ func validUsername(name string) bool {
 		}
 	}
 	return true
+}
+
+// reservedUsernames mirrors cherm_proto::RESERVED_USERNAMES: names reserved for
+// system/server identities that a normal user may never claim.
+var reservedUsernames = map[string]bool{"system": true, "server": true}
+
+// isReservedUsername reports whether name collides with a reserved system /
+// server identity (case-insensitive). The server is the real authority; this is
+// local UX so the user gets immediate feedback.
+func isReservedUsername(name string) bool {
+	return reservedUsernames[strings.ToLower(name)]
 }
 
 // envServer returns the server address override from CHERM_SERVER, if set.

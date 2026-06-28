@@ -83,8 +83,28 @@ make server                 # 0.0.0.0:9000, software-signature tier (dev key)
 
 Server flags: `--addr`, `--db`, `--no-attest` (advertise the unsigned tier —
 clients show red), `--release-secret <b64>` (sign with a real release key),
-`--instance-key <path>`, `--version <str>`. The genuine TEE (green) tier is
-produced by deploying the official image in an **AWS Nitro enclave**.
+`--instance-key <path>`, `--version <str>`, `--config <path>`. The genuine TEE
+(green) tier is produced by deploying the official image in an **AWS Nitro
+enclave**.
+
+`--config <path>` is a JSON file of operator settings (nothing hardcoded):
+
+```json
+{
+  "name": "Cherm Main",
+  "repo_url": "https://github.com/cherm-chat/cherm",
+  "description": "official relay",
+  "contact": "ops@cherm.chat",
+  "reject_unofficial_clients": false,
+  "allowed_client_hashes": ["<official cherm-core build hash>"]
+}
+```
+
+The metadata (`name`/`repo_url`/…) is shown to users on the verdict screen so
+they can see what codebase the server **claims** to run. Set
+`reject_unofficial_clients: true` to only admit clients whose build hash is in
+`allowed_client_hashes` (a deterrent — a client can lie about its hash; only a
+client-side TEE would make it unforgeable).
 
 Start the TUI (per user):
 
@@ -109,7 +129,19 @@ username for that server. Each server keeps its own account and encrypted vault.
 | *(anything else)* | send to the open chat |
 
 `Tab` switches focus, `↑/↓` select, `Enter` opens/sends, `Esc` opens the menu /
-goes back. `/dm <your-own-name>` is rejected. Messages render as:
+goes back. With the **chat list focused**, press **`x`** to leave the selected
+chat — a *Leave this chat?* confirmation appears (Cancel by default); only on
+**Leave** does it happen. Leaving notifies the other side with a system line and
+removes the chat from your list:
+
+```
+[✣ System][28/06/26 - 14:05:10]> alice left the chat.
+```
+
+System notices come from the reserved **`System`** identity. The usernames
+`System` and `Server` (case-insensitive) are reserved and can never be
+registered, so no user can impersonate a system/server identity.
+`/dm <your-own-name>` is rejected. Messages render as:
 
 ```
 [bob][28/06/26 - 14:03:21]> hey there
@@ -136,5 +168,8 @@ a magenta→pink accent palette on a near-black base.
   (Argon2id via `CHERM_PASSPHRASE`) is a planned hardening step.
 - A `is_premium` flag (always `false`) and a per-message color hook are wired
   for a future "choose your colors" subscription; not surfaced today.
-- MVP gaps tracked in the docs: group key rotation on member removal,
-  sealed-sender, Olm session "glare", and outbox delivery acks.
+- MVP gaps tracked in the docs: **Megolm group keys are not rotated when a
+  member leaves** (the leaver keeps the old session key, so they could still
+  read *future* messages sent on it until the next rekey), sealed-sender, and
+  outbox delivery acks. (Olm now re-establishes on a fresh prekey, handling the
+  leave/re-contact and basic "glare" cases.)

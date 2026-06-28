@@ -33,6 +33,23 @@ pub fn valid_username(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Usernames reserved for internal system / server identities. Regular users
+/// may never register, rename to, or be displayed as these — they are reserved
+/// for system messages, announcements and server-level events. Compared
+/// case-insensitively so neither `System` nor `system` (etc.) can be claimed.
+pub const RESERVED_USERNAMES: &[&str] = &["system", "server"];
+
+/// True if `name` collides with a reserved system/server identity (case-insensitive).
+pub fn is_reserved_username(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    RESERVED_USERNAMES.contains(&lower.as_str())
+}
+
+/// True if `name` is a valid AND non-reserved username (the rule for registration).
+pub fn is_registerable_username(name: &str) -> bool {
+    valid_username(name) && !is_reserved_username(name)
+}
+
 /// One published one-time prekey: an id and its base64 Curve25519 public key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneTimeKey {
@@ -70,6 +87,17 @@ pub enum ClientMsg {
     /// Request a server attestation. Run before registering / authenticating so
     /// the client can show a trust verdict first.
     AttestRequest { nonce: String },
+    /// Announce the client build (sent right after connecting, pre-auth) so the
+    /// server can enforce an official-client policy. Honest limit: a client can
+    /// lie about its hash (no client TEE), so this is a deterrent, like the
+    /// software attestation tier.
+    ClientHello {
+        /// Hex BLAKE3 of the client (core) build artifact.
+        build_hash: String,
+        client_version: String,
+    },
+    /// Request the server's public metadata (repo URL, name, ...). Pre-auth.
+    GetServerInfo,
     /// Relay an end-to-end-encrypted message to one or more recipients.
     Send {
         /// Recipient usernames. For 1:1 this is a single name; for a group
@@ -114,6 +142,15 @@ pub enum ServerMsg {
     /// Result of `AttestRequest`: the server attestation
     /// (`cherm_attest::Attestation` serialized as JSON).
     AttestResponse { attestation: serde_json::Value },
+    /// Result of `GetServerInfo`: the server owner's public metadata so users can
+    /// see what codebase the server claims to run. All operator-supplied.
+    ServerInfo {
+        name: String,
+        repo_url: String,
+        description: String,
+        contact: String,
+        version: String,
+    },
     /// A relayed end-to-end-encrypted message addressed to this client.
     Deliver {
         from: String,
@@ -140,6 +177,8 @@ pub enum ServerMsg {
 pub mod errcode {
     pub const USERNAME_TAKEN: &str = "username_taken";
     pub const USERNAME_INVALID: &str = "username_invalid";
+    pub const USERNAME_RESERVED: &str = "username_reserved";
+    pub const UNOFFICIAL_CLIENT: &str = "unofficial_client";
     pub const KEY_ALREADY_REGISTERED: &str = "key_already_registered";
     pub const UNKNOWN_USER: &str = "unknown_user";
     pub const NO_PREKEYS: &str = "no_prekeys";
@@ -205,6 +244,18 @@ mod tests {
         assert!(!valid_username("has space"));
         assert!(!valid_username("dash-no"));
         assert!(!valid_username("emoji😀"));
+    }
+
+    #[test]
+    fn reserved_usernames() {
+        for n in ["System", "system", "Server", "server", "SYSTEM", "SeRvEr"] {
+            assert!(is_reserved_username(n), "{n} must be reserved");
+            assert!(!is_registerable_username(n), "{n} must not be registerable");
+        }
+        assert!(!is_reserved_username("alice"));
+        assert!(is_registerable_username("alice"));
+        // valid charset but reserved:
+        assert!(valid_username("system") && !is_registerable_username("system"));
     }
 
     #[tokio::test]

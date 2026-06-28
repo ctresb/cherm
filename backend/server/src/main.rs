@@ -18,6 +18,7 @@
 //!   * Each connection is driven by `conn::handle` (see that module).
 
 mod attest;
+mod config;
 mod conn;
 mod db;
 
@@ -44,6 +45,7 @@ struct Config {
     release_secret: Option<String>,
     instance_key: Option<String>,
     version: Option<String>,
+    config: Option<String>,
 }
 
 impl Config {
@@ -58,6 +60,7 @@ impl Config {
         let mut release_secret = None;
         let mut instance_key = None;
         let mut version = None;
+        let mut config = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -75,6 +78,7 @@ impl Config {
                 "--release-secret" => release_secret = args.next(),
                 "--instance-key" => instance_key = args.next(),
                 "--version" => version = args.next(),
+                "--config" => config = args.next(),
                 other => {
                     eprintln!("warning: ignoring unknown argument: {other}");
                 }
@@ -87,6 +91,7 @@ impl Config {
             release_secret,
             instance_key,
             version,
+            config,
         }
     }
 
@@ -144,6 +149,20 @@ async fn main() -> Result<()> {
     );
     let attestor: attest::Shared = Arc::new(attestor);
 
+    // Load operator config (public metadata + official-client policy), if given.
+    let server_config = match &cfg.config {
+        Some(path) => config::ServerConfig::load(std::path::Path::new(path))
+            .with_context(|| format!("loading config {path}"))?,
+        None => config::ServerConfig::default(),
+    };
+    info!(
+        name = %server_config.name,
+        repo_url = %server_config.repo_url,
+        reject_unofficial = server_config.reject_unofficial_clients,
+        "server config loaded"
+    );
+    let server_config: config::Shared = Arc::new(server_config);
+
     // Open the database and build the shared state handles.
     let conn = db::open(&cfg.db).with_context(|| format!("opening database {}", cfg.db))?;
     let database: Db = Arc::new(Mutex::new(conn));
@@ -169,8 +188,9 @@ async fn main() -> Result<()> {
         let online = online.clone();
         let database = database.clone();
         let attestor = attestor.clone();
+        let server_config = server_config.clone();
         tokio::spawn(async move {
-            conn::handle(stream, peer, online, database, attestor).await;
+            conn::handle(stream, peer, online, database, attestor, server_config).await;
         });
     }
 }

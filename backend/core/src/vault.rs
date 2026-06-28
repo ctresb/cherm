@@ -374,6 +374,31 @@ pub fn add_member(v: &Vault, chat_id: &str, username: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove one member from a chat's roster (used when someone leaves a group).
+pub fn remove_member(v: &Vault, chat_id: &str, username: &str) -> Result<()> {
+    let conn = v.lock().expect("vault mutex poisoned");
+    conn.execute(
+        "DELETE FROM chat_members WHERE chat_id = ?1 AND username = ?2",
+        params![chat_id, username],
+    )?;
+    Ok(())
+}
+
+/// Delete a chat and ALL of its local state when the user leaves it: the chat
+/// row, its roster, its messages, and any crypto sessions tied to it (the DM's
+/// Olm session keyed by the peer == chat_id, and the group's in/out Megolm
+/// sessions keyed by the group id == chat_id).
+pub fn delete_chat(v: &Vault, chat_id: &str) -> Result<()> {
+    let conn = v.lock().expect("vault mutex poisoned");
+    conn.execute("DELETE FROM chats WHERE id = ?1", params![chat_id])?;
+    conn.execute("DELETE FROM chat_members WHERE chat_id = ?1", params![chat_id])?;
+    conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![chat_id])?;
+    conn.execute("DELETE FROM olm_sessions WHERE peer = ?1", params![chat_id])?;
+    conn.execute("DELETE FROM group_out WHERE group_id = ?1", params![chat_id])?;
+    conn.execute("DELETE FROM group_in WHERE group_id = ?1", params![chat_id])?;
+    Ok(())
+}
+
 pub fn get_members(v: &Vault, chat_id: &str) -> Result<Vec<String>> {
     let conn = v.lock().expect("vault mutex poisoned");
     let mut stmt = conn.prepare("SELECT username FROM chat_members WHERE chat_id = ?1")?;

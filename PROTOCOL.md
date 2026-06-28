@@ -50,6 +50,8 @@ TCP, length-prefixed JSON (4-byte big-endian length + JSON). Use
 | variant | fields | meaning |
 |---|---|---|
 | `AttestRequest` | `nonce` | request attestation (run FIRST, pre-auth) |
+| `ClientHello` | `build_hash, client_version` | announce client build (official-client policy) |
+| `GetServerInfo` | — | fetch the server's public metadata (pre-auth) |
 | `Register` | `username, ed25519, curve25519, machine_id` | create immutable identity; auto-authenticates |
 | `AuthBegin` | `username` | start login → `Challenge` |
 | `AuthFinish` | `username, signature` | base64 Ed25519 sig over the **raw decoded** nonce |
@@ -67,6 +69,7 @@ TCP, length-prefixed JSON (4-byte big-endian length + JSON). Use
 | `Challenge` | `nonce` (base64, 32 bytes) |
 | `AuthOk` | `uuid, username` |
 | `PrekeyBundle` | `username, uuid, ed25519, curve25519, one_time_key_id?, one_time_key?` |
+| `ServerInfo` | `name, repo_url, description, contact, version` (operator-supplied) |
 | `Deliver` | `from, to:[String], msg_type, payload, group_id?, server_ts, client_ts` |
 | `Ok` | `detail?` · `Error` | `code,message` · `Pong` | — |
 
@@ -77,6 +80,14 @@ TCP, length-prefixed JSON (4-byte big-endian length + JSON). Use
   session key over the pairwise Olm channel).
 - `"megolm"` — a Megolm group message (base64 of `GroupSender::encrypt`), with
   `group_id` set.
+- `"olm_system"` / `"megolm_system"` — a system notice (a "left the chat"
+  event) over the same Olm/Megolm crypto. The receiver IGNORES the decrypted
+  body and renders the notice from the relay-asserted `from` (so the leaver's
+  name can't be spoofed), attributed to the reserved "System" identity.
+
+Usernames `System`/`Server` (case-insensitive, `cherm_proto::is_reserved_username`)
+are reserved and rejected at registration — so no real user can impersonate a
+system/server identity.
 
 ### Sequence
 ```
@@ -105,7 +116,14 @@ outbox( id PK AUTOINCREMENT, recipient, frame, ts )          -- ciphertext frame
 Server attestation: on `AttestRequest` it builds `build_software` (default,
 holding `ReleaseKey` + a persisted `InstanceKey`) — or `build_unsigned` with
 `--no-attest`, or the TEE path on a Nitro deployment. Flags:
-`--addr --db --no-attest --release-secret <b64> --instance-key <path> --version`.
+`--addr --db --no-attest --release-secret <b64> --instance-key <path> --version --config <path>`.
+Registration rejects reserved usernames (`System`/`Server`). `--config` points at a
+JSON `ServerConfig` with operator-supplied public metadata
+(`name, repo_url, description, contact`) served by `GetServerInfo`, plus an
+official-client policy (`reject_unofficial_clients: bool`,
+`allowed_client_hashes: [..]`) checked at `Register`/`AuthFinish` against the
+client's `ClientHello` build hash. Honest limit: a client can lie about its hash
+(no client TEE), so the policy is a deterrent, like the software attestation tier.
 
 ## 4. IPC protocol (tui ⇄ core) — multi-server
 
@@ -122,8 +140,11 @@ The core manages **many servers**; chat commands act on the **active** server.
 {"cmd":"list_chats"} {"cmd":"history","chat":id,"limit":200}
 {"cmd":"start_dm","username":"bob"} {"cmd":"create_group","name":"x","members":[...]}
 {"cmd":"send","chat":id,"text":"hi"} {"cmd":"ping"} {"cmd":"quit"}
+{"cmd":"leave_chat","chat":id}                    // leave a DM or group (after a UI confirm)
 ```
-`start_dm` of your own username → `error` (`code:"self_dm"`).
+`start_dm` of your own username → `error` (`code:"self_dm"`). `leave_chat`
+notifies the other side with an `*_system` message, then deletes the chat (and
+its sessions) from the local vault.
 
 ### Events (core → tui)
 ```
@@ -131,14 +152,15 @@ The core manages **many servers**; chat commands act on the **active** server.
 {"event":"servers","servers":[{"id","addr","tier","verdict","username":string|null,"active":bool}]}
 {"event":"attest","server":addr,"verdict":"green|yellow|red","tier":"unsigned|software|tee",
    "reason":...,"build_hash":...,"fingerprint":...,
-   "public_codebase_url":...,"signatures_url":...}
+   "public_codebase_url":...,"signatures_url":...,
+   "server_name":...,"repo_url":...,"description":...}   // operator metadata
 {"event":"need_username","server":addr}            // connected, attested, no account yet
 {"event":"registered","server":addr,"username":...,"uuid":...}
 {"event":"connected","server":addr,"username":...,"active":true}
 {"event":"disconnected","server":addr,"reason":...}
 {"event":"chats","server":addr,"chats":[{"id","kind","title","last_ts"}]}
 {"event":"history","chat":id,"messages":[{"from","text","ts","outgoing"}]}
-{"event":"message","chat":id,"from","text","ts","outgoing":bool,"color":null}
+{"event":"message","chat":id,"from","text","ts","outgoing":bool,"color":null,"system":bool}
 {"event":"fingerprint","username":bob,"fingerprint":"...."}    // peer safety number
 {"event":"error","message":...,"code":...} {"event":"info","message":...}
 {"event":"pong","rtt_ms":N,"server":addr}

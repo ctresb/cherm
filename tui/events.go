@@ -35,6 +35,7 @@ type Message struct {
 	Ts       int64  `json:"ts"` // unix millis
 	Outgoing bool   `json:"outgoing"`
 	Color    string `json:"color,omitempty"` // reserved for premium; "" => white
+	System   bool   `json:"system,omitempty"` // a "✣ System" event (e.g. a leave notice)
 }
 
 // --- typed tea.Msg values delivered to the model ---
@@ -58,6 +59,10 @@ type attestMsg struct {
 	fingerprint       string
 	publicCodebaseURL string
 	signaturesURL     string
+	// operator-supplied public metadata (what codebase the server claims to run)
+	serverName  string
+	repoURL     string
+	description string
 }
 
 type needUsernameMsg struct {
@@ -98,6 +103,7 @@ type messageMsg struct {
 	ts       int64
 	outgoing bool
 	color    string
+	system   bool
 }
 
 // fingerprintMsg carries a peer's safety number (the "fingerprint" event).
@@ -152,6 +158,9 @@ type coreEvent struct {
 	Fingerprint       string `json:"fingerprint"` // also reused by "fingerprint"
 	PublicCodebaseURL string `json:"public_codebase_url"`
 	SignaturesURL     string `json:"signatures_url"`
+	ServerName        string `json:"server_name"`
+	RepoURL           string `json:"repo_url"`
+	Description       string `json:"description"`
 
 	// chats
 	Chats []ChatInfo `json:"chats"`
@@ -166,6 +175,7 @@ type coreEvent struct {
 	Ts       int64  `json:"ts"`
 	Outgoing bool   `json:"outgoing"`
 	Color    string `json:"color"`
+	System   bool   `json:"system"`
 
 	// error / info (the "message" event has no "message" JSON field, so this
 	// only ever populates for error/info lines)
@@ -198,6 +208,9 @@ func parseEvent(line []byte) any {
 			fingerprint:       e.Fingerprint,
 			publicCodebaseURL: e.PublicCodebaseURL,
 			signaturesURL:     e.SignaturesURL,
+			serverName:        e.ServerName,
+			repoURL:           e.RepoURL,
+			description:       e.Description,
 		}
 	case "need_username":
 		return needUsernameMsg{server: e.Server}
@@ -219,6 +232,7 @@ func parseEvent(line []byte) any {
 			ts:       e.Ts,
 			outgoing: e.Outgoing,
 			color:    e.Color,
+			system:   e.System,
 		}
 	case "fingerprint":
 		return fingerprintMsg{username: e.Username, fingerprint: e.Fingerprint}

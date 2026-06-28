@@ -261,6 +261,21 @@ async fn process_one(ctx: &ProcCtx, inc: &Incoming) -> Result<()> {
                 .ok_or_else(|| anyhow!("megolm frame missing group_id"))?;
             process_megolm(ctx, &inc.from, gid, &inc.payload, inc.client_ts)?;
         }
+        // A DM "left the chat" notice over Olm. We still decrypt (to advance the
+        // ratchet) but IGNORE the plaintext and render the notice from the
+        // relay-asserted `from`, so the leaver's name can't be spoofed.
+        "olm_system" => {
+            let _ = obtain_olm_plaintext(ctx, &inc.from, &inc.payload).await?;
+            deliver_system(ctx, &inc.from, &inc.from, inc.client_ts)?;
+        }
+        // A group "left the chat" notice over Megolm.
+        "megolm_system" => {
+            let gid = inc
+                .group_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("megolm_system missing group_id"))?;
+            process_megolm_system(ctx, &inc.from, gid, &inc.payload, inc.client_ts)?;
+        }
         other => tracing::warn!("ignoring unknown msg_type {other:?} from {}", inc.from),
     }
     Ok(())
@@ -272,14 +287,28 @@ async fn process_one(ctx: &ProcCtx, inc: &Incoming) -> Result<()> {
 async fn obtain_olm_plaintext(ctx: &ProcCtx, from: &str, payload: &str) -> Result<Vec<u8>> {
     let (olm_type, body) = parse_olm(payload)?;
 
-    // Existing session: decrypt + re-persist (the ratchet advanced).
+    // Existing session: try to decrypt + re-persist (the ratchet advanced).
     if let Some(mut session) = vault::load_olm(&ctx.vault, &ctx.vault_key, from)? {
-        let plaintext = session.decrypt(olm_type, &body)?;
-        vault::save_olm(&ctx.vault, &ctx.vault_key, from, &session)?;
-        return Ok(plaintext);
+        match session.decrypt(olm_type, &body) {
+            Ok(plaintext) => {
+                vault::save_olm(&ctx.vault, &ctx.vault_key, from, &session)?;
+                return Ok(plaintext);
+            }
+            Err(e) => {
+                // A normal (type 1) message that fails to decrypt is a real
+                // error. But a PREKEY (type 0) message may be the peer starting a
+                // brand-new session (e.g. after one side left and re-contacted,
+                // or Olm "glare") that our stored session cannot decrypt — fall
+                // through and establish a fresh inbound session instead.
+                if olm_type != 0 {
+                    return Err(e);
+                }
+                tracing::info!("prekey for a new session from {from}; re-establishing");
+            }
+        }
     }
 
-    // No session yet: we need the sender's curve25519 to accept the prekey msg.
+    // No usable session: we need the sender's curve25519 to accept the prekey msg.
     let curve = match vault::get_contact_curve(&ctx.vault, from)? {
         Some(c) => c,
         None => {
@@ -389,6 +418,47 @@ fn process_megolm(
     ctx.events.emit(json!({
         "event": "message", "chat": group_id, "from": from,
         "text": text, "ts": client_ts, "outgoing": false, "color": null
+    }));
+    Ok(())
+}
+
+/// A group "left" notice over Megolm: decrypt (to advance the ratchet), drop
+/// the leaver from the local roster, and surface a system message. The leaver's
+/// name comes from the relay-asserted `from`, not the (ignored) plaintext.
+fn process_megolm_system(
+    ctx: &ProcCtx,
+    from: &str,
+    group_id: &str,
+    payload: &str,
+    client_ts: i64,
+) -> Result<()> {
+    let mut receiver = match vault::load_group_in(&ctx.vault, &ctx.vault_key, group_id, from)? {
+        Some(r) => r,
+        None => {
+            ctx.events.emit(json!({
+                "event": "error", "code": "decrypt_pending",
+                "message": format!("no inbound session for group {group_id} from {from} yet")
+            }));
+            return Ok(());
+        }
+    };
+    let body = cherm_crypto::b64_decode(payload)?;
+    let _ = receiver.decrypt(&body)?; // advance ratchet; plaintext ignored
+    vault::save_group_in(&ctx.vault, &ctx.vault_key, group_id, from, &receiver)?;
+
+    vault::remove_member(&ctx.vault, group_id, from)?;
+    deliver_system(ctx, group_id, from, client_ts)?;
+    Ok(())
+}
+
+/// Record + surface a "✣ System" message attributing a leave to `leaver`. Stored
+/// under the reserved "System" sender so it can never be confused with a user.
+fn deliver_system(ctx: &ProcCtx, chat: &str, leaver: &str, client_ts: i64) -> Result<()> {
+    let text = format!("{leaver} left the chat.");
+    vault::insert_message(&ctx.vault, chat, "System", &text, client_ts, 0)?;
+    ctx.events.emit(json!({
+        "event": "message", "chat": chat, "from": "System",
+        "text": text, "ts": client_ts, "outgoing": false, "system": true, "color": null
     }));
     Ok(())
 }

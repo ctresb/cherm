@@ -30,8 +30,11 @@ func verdictBadge(verdict, tier string) string {
 		return badgeGreen.Render(label)
 	case "yellow":
 		return badgeYellow.Render(label)
-	default:
+	case "red":
 		return badgeRed.Render(label)
+	default:
+		// Not attested yet — neutral, not a scary red block.
+		return badgeOff.Render("unchecked")
 	}
 }
 
@@ -118,6 +121,13 @@ func (m Model) verdictView() string {
 		b.WriteString(footerStyle.Render("press o or click to open the public codebase ↗") + "\n\n")
 	}
 
+	// Operator-supplied metadata: what codebase this server *claims* to run.
+	if v.serverName != "" {
+		b.WriteString(infoRow("name", truncate(v.serverName, 44)))
+	}
+	if v.repoURL != "" {
+		b.WriteString(infoRow("claims", truncate(v.repoURL, 44)))
+	}
 	if v.tier != "" {
 		b.WriteString(infoRow("tier", v.tier))
 	}
@@ -184,6 +194,20 @@ func (m Model) usernameView() string {
 	b.WriteString("\n\n" + footerStyle.Render("enter: register   esc: back   ctrl+c: quit"))
 
 	return m.center(panelStyle().Render(b.String()))
+}
+
+// ---- leave-chat confirmation ----
+
+// leaveConfirmView renders the "Leave this chat?" confirmation with Leave /
+// Cancel buttons (Cancel selected by default — leaving is destructive).
+func (m Model) leaveConfirmView() string {
+	var b strings.Builder
+	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true) + "\n\n")
+	b.WriteString(menuLabel.Render("Leave this chat?") + "\n")
+	b.WriteString(footerStyle.Render(m.leaveChatTitle) + "\n\n")
+	b.WriteString(renderButtons(m.leaveSel, "Leave", "Cancel", false))
+	b.WriteString("\n\n" + footerStyle.Render("←/→ or tab: move · enter: select · esc: cancel"))
+	return m.center(panelStyle().Width(48).Render(b.String()))
 }
 
 // ---- chat ----
@@ -308,7 +332,7 @@ func (m Model) footerView() string {
 		line1 = footerStyle.Render(left+"  |  ") + style.Render(status)
 	}
 
-	hint := "/dm  /group  /servers  /menu  /help  /quit  ·  tab: focus  ·  esc: menu  ·  enter: open/send"
+	hint := "/dm  /group  /servers  /menu  /help  /quit  ·  tab: focus  ·  x: leave  ·  esc: menu  ·  enter: open/send"
 	line2 := footerStyle.Render(hint)
 
 	out := lipgloss.JoinVertical(lipgloss.Left, line1, line2)

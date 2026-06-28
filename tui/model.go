@@ -22,6 +22,7 @@ const (
 	screenChat                    // sidebar + messages + input
 	screenMenu                    // server / ping / change-server / docs
 	screenHelp                    // command + key reference
+	screenLeaveConfirm            // "Leave this chat?" confirmation
 )
 
 // menuItemCount is the number of selectable rows on the menu screen.
@@ -106,6 +107,11 @@ type Model struct {
 	sidebarSel   int
 	current      string            // id of the open chat
 	fingerprints map[string]string // peer username -> safety number
+
+	// leave-chat confirmation
+	leaveChatID    string // chat id pending a leave confirmation
+	leaveChatTitle string // its display title
+	leaveSel       int    // 0 = Leave, 1 = Cancel (defaults to Cancel)
 
 	// menu screen
 	menuSel int
@@ -218,6 +224,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateMenu(msg)
 		case screenHelp:
 			return m.updateHelp(msg)
+		case screenLeaveConfirm:
+			return m.updateLeaveConfirm(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -570,6 +578,10 @@ func (m Model) updateUsername(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.onboardErr = "username must be 1-16 chars, letters and digits only"
 			return m, nil
 		}
+		if isReservedUsername(u) {
+			m.onboardErr = "that username is reserved for system use"
+			return m, nil
+		}
 		m.onboardErr = ""
 		m.flash("registering "+u+"...", false)
 		return m, m.cmdSend(map[string]any{
@@ -606,6 +618,8 @@ func (m Model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			return m.openSelectedChat()
+		case "x":
+			return m.openLeaveConfirm()
 		case "esc":
 			return m.openMenu()
 		}
@@ -822,6 +836,51 @@ func (m Model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ---- leave-chat confirmation ----
+
+// openLeaveConfirm starts the "Leave this chat?" flow for the highlighted chat.
+// The action only happens after explicit confirmation (default = Cancel).
+func (m Model) openLeaveConfirm() (tea.Model, tea.Cmd) {
+	if m.sidebarSel < 0 || m.sidebarSel >= len(m.chats) {
+		return m, nil
+	}
+	cs := m.chats[m.sidebarSel]
+	m.leaveChatID = cs.info.ID
+	m.leaveChatTitle = cs.info.Title
+	if m.leaveChatTitle == "" {
+		m.leaveChatTitle = cs.info.ID
+	}
+	m.leaveSel = 1 // default to Cancel — leaving is destructive
+	m.screen = screenLeaveConfirm
+	return m, nil
+}
+
+func (m Model) updateLeaveConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "h", "right", "l", "tab", "shift+tab":
+		m.leaveSel = 1 - m.leaveSel
+		return m, nil
+	case "esc":
+		m.screen = screenChat
+		return m, nil
+	case "enter":
+		if m.leaveSel == 0 { // Leave
+			id := m.leaveChatID
+			m.screen = screenChat
+			if id == m.current {
+				m.current = ""
+				m.viewport.SetContent("")
+			}
+			m.flash("leaving "+m.leaveChatTitle+"...", false)
+			return m, m.cmdSend(map[string]any{"cmd": "leave_chat", "chat": id})
+		}
+		// Cancel — nothing changes.
+		m.screen = screenChat
+		return m, nil
+	}
+	return m, nil
+}
+
 // ---- core-event helpers ----
 
 // applyChats rebuilds the sidebar from a chats event, preserving any locally
@@ -866,6 +925,7 @@ func (m Model) onMessage(msg messageMsg) (tea.Model, tea.Cmd) {
 		Ts:       msg.ts,
 		Outgoing: msg.outgoing,
 		Color:    msg.color,
+		System:   msg.system,
 	})
 	if msg.ts > cs.info.LastTs {
 		cs.info.LastTs = msg.ts
@@ -1006,6 +1066,8 @@ func (m Model) View() string {
 		return m.menuView()
 	case screenHelp:
 		return m.helpView()
+	case screenLeaveConfirm:
+		return m.leaveConfirmView()
 	default:
 		return m.chatView()
 	}

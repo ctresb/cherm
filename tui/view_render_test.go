@@ -187,13 +187,51 @@ func TestRenderServerScreens(t *testing.T) {
 	}
 }
 
+func TestReservedUsernames(t *testing.T) {
+	for _, n := range []string{"System", "system", "Server", "server", "SeRvEr"} {
+		if !isReservedUsername(n) {
+			t.Errorf("%q must be reserved", n)
+		}
+	}
+	if isReservedUsername("alice") {
+		t.Error("alice must not be reserved")
+	}
+	if !validUsername("system") || isReservedUsername("alice") {
+		t.Error("sanity: 'system' is valid charset but reserved")
+	}
+}
+
+func TestLeaveConfirmView(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(termenv.ANSI)
+	m := renderModel(screenLeaveConfirm)
+	m.leaveChatID = "bob"
+	m.leaveChatTitle = "bob"
+	m.leaveSel = 1
+	out := strip(m.View())
+	for _, want := range []string{"Leave this chat?", "Leave", "Cancel", "bob"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("leave-confirm view missing %q", want)
+		}
+	}
+}
+
 // Message bubbles must stay white (premium-gated, PROTOCOL.md section 6): the
 // prefix is bold but neither prefix nor body carries a foreground color.
 func TestBubbleStaysWhiteAndBold(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	defer lipgloss.SetColorProfile(termenv.ANSI)
 
-	out := renderMessage("you", 1700000000000, "secret", "")
+	// A system "left the chat" line renders as "✣ System", never as a user.
+	sys := renderMessage("alice", 1700000000000, "alice left the chat.", "", true)
+	if !strings.Contains(strip(sys), "✣ System") {
+		t.Error("system message must render as ✣ System")
+	}
+	if !strings.Contains(strip(sys), "left the chat.") {
+		t.Error("system message must carry the notice text")
+	}
+
+	out := renderMessage("you", 1700000000000, "secret", "", false)
 	if !strings.Contains(out, "\x1b[1m") {
 		t.Error("bubble prefix should be bold")
 	}

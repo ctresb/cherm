@@ -43,6 +43,8 @@ pub enum Command {
     CreateGroup { name: String, members: Vec<String> },
     /// `{"cmd":"send","chat":"bob","text":"hi"}`
     Send { chat: String, text: String },
+    /// `{"cmd":"leave_chat","chat":"bob"}` — leave a DM or group (after confirm).
+    LeaveChat { chat: String },
     /// `{"cmd":"ping"}`
     Ping,
     /// `{"cmd":"quit"}`

@@ -25,6 +25,9 @@ use crate::{attest_client, now_millis};
 /// Number of one-time keys published per (re)connect.
 const PREKEY_BATCH: usize = 20;
 
+/// Advertised client version (sent in `ClientHello` for the official-client policy).
+const CLIENT_VERSION: &str = "0.1.0+dev";
+
 // ===========================================================================
 // Persisted server index (~/.cherm/servers.json)
 // ===========================================================================
@@ -156,6 +159,7 @@ impl App {
             Command::StartDm { username } => self.start_dm(username).await,
             Command::CreateGroup { name, members } => self.create_group(name, members).await,
             Command::Send { chat, text } => self.send(chat, text).await,
+            Command::LeaveChat { chat } => self.leave_chat(chat).await,
             Command::Ping => self.ping().await,
             Command::Quit => self.quit().await,
         }
@@ -178,6 +182,9 @@ impl App {
                     "fingerprint": out.fingerprint,
                     "public_codebase_url": cherm_attest::PUBLIC_CODEBASE_URL,
                     "signatures_url": cherm_attest::SIGNATURES_URL,
+                    "server_name": out.server_name,
+                    "repo_url": out.repo_url,
+                    "description": out.description,
                 }));
                 self.index.set_attest(
                     &server,
@@ -200,6 +207,13 @@ impl App {
             self.events.emit(err_event(
                 cherm_proto::errcode::USERNAME_INVALID,
                 "username must be 1-16 alphanumeric characters",
+            ));
+            return Ok(());
+        }
+        if cherm_proto::is_reserved_username(&username) {
+            self.events.emit(err_event(
+                cherm_proto::errcode::USERNAME_RESERVED,
+                "that username is reserved for system use",
             ));
             return Ok(());
         }
@@ -238,6 +252,10 @@ impl App {
             username.clone(),
             server.clone(),
         );
+
+        // Announce our build so a server enforcing an official-client policy can
+        // accept/reject us (the reply is just an Ok we consume here).
+        let _ = net::send_and_wait(&link, client_hello()).await;
 
         let reply = net::send_and_wait(
             &link,
@@ -346,6 +364,9 @@ impl App {
             username.clone(),
             server.clone(),
         );
+
+        // Announce our build (official-client policy) before authenticating.
+        let _ = net::send_and_wait(&link, client_hello()).await;
 
         // AuthBegin -> Challenge -> sign(b64decode(nonce)) -> AuthFinish -> AuthOk.
         let nonce = match net::send_and_wait(&link, ClientMsg::AuthBegin { username: username.clone() }).await? {
@@ -777,6 +798,101 @@ impl App {
         Ok(())
     }
 
+    /// `leave_chat` -> leave a DM or group: notify the other side with a system
+    /// message, then delete the chat (and its sessions) from the local vault.
+    async fn leave_chat(&mut self, chat: String) -> Result<()> {
+        let (server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
+            None => {
+                self.events.emit(err_event("not_connected", "no active server"));
+                return Ok(());
+            }
+        };
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
+        let (kind, title) = match vault::get_chat(&vault, &chat)? {
+            Some(c) => c,
+            None => {
+                self.events
+                    .emit(err_event("no_such_chat", &format!("unknown chat {chat}")));
+                return Ok(());
+            }
+        };
+        let link = self.active_link();
+        let now = now_millis();
+
+        match kind.as_str() {
+            "dm" => {
+                // Notify the peer (best-effort) over the existing Olm session.
+                if let Some(link) = &link {
+                    if let Some(mut session) = vault::load_olm(&vault, &vk, &chat)? {
+                        let (t, body) = session.encrypt(b"left")?;
+                        vault::save_olm(&vault, &vk, &chat, &session)?;
+                        let _ = net::send(
+                            link,
+                            ClientMsg::Send {
+                                to: vec![chat.clone()],
+                                msg_type: "olm_system".to_string(),
+                                payload: net::encode_olm(t, &body),
+                                group_id: None,
+                                client_ts: now,
+                            },
+                        );
+                    }
+                }
+            }
+            "group" => {
+                if let Some(link) = &link {
+                    let members = vault::get_members(&vault, &chat)?;
+                    // Need an outbound Megolm session to broadcast the notice;
+                    // mint + distribute one if we never spoke in this group.
+                    let mut sender = match vault::load_group_out(&vault, &vk, &chat)? {
+                        Some(s) => s,
+                        None => {
+                            let s = cherm_crypto::GroupSender::new();
+                            vault::save_group_out(&vault, &vk, &chat, &s)?;
+                            self.distribute_group_key(&vault, &vk, link, &me, &chat, &title, &members, &s)
+                                .await?;
+                            s
+                        }
+                    };
+                    let bytes = sender.encrypt(b"left");
+                    vault::save_group_out(&vault, &vk, &chat, &sender)?;
+                    let recipients: Vec<String> =
+                        members.into_iter().filter(|m| *m != me).collect();
+                    let _ = net::send(
+                        link,
+                        ClientMsg::Send {
+                            to: recipients,
+                            msg_type: "megolm_system".to_string(),
+                            payload: cherm_crypto::b64_encode(&bytes),
+                            group_id: Some(chat.clone()),
+                            client_ts: now,
+                        },
+                    );
+                }
+            }
+            other => {
+                self.events
+                    .emit(err_event("bad_request", &format!("unknown chat kind {other}")));
+                return Ok(());
+            }
+        }
+
+        // Remove the chat and all its local state.
+        vault::delete_chat(&vault, &chat)?;
+        let notified = if link.is_some() { "" } else { " (offline — peers not notified)" };
+        self.events.emit(vault::build_chats_event(&vault, &server)?);
+        self.events
+            .emit(json!({"event": "info", "message": format!("left {chat}{notified}")}));
+        Ok(())
+    }
+
     /// `ping` -> measure round-trip latency to the active server.
     async fn ping(&mut self) -> Result<()> {
         let server = match self.active.clone() {
@@ -876,7 +992,7 @@ impl App {
         let messages: Vec<Value> = vault::get_messages(vault, chat, limit)?
             .into_iter()
             .map(|(sender, body, ts, outgoing)| {
-                json!({"from": sender, "text": body, "ts": ts, "outgoing": outgoing != 0})
+                json!({"from": sender, "text": body, "ts": ts, "outgoing": outgoing != 0, "system": sender == "System"})
             })
             .collect();
         self.events
@@ -952,6 +1068,15 @@ impl App {
         let path = self.home.join("servers.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&self.index)?)?;
         Ok(())
+    }
+}
+
+/// Build a `ClientHello` announcing this client's build hash + version, so a
+/// server enforcing an official-client policy can accept or reject us.
+fn client_hello() -> ClientMsg {
+    ClientMsg::ClientHello {
+        build_hash: cherm_attest::build_hash(),
+        client_version: CLIENT_VERSION.to_string(),
     }
 }
 
