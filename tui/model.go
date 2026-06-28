@@ -263,6 +263,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layout()
 		return m, nil
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.KeyMsg:
 		// Ctrl+C always exits cleanly, regardless of screen/focus.
 		if msg.String() == "ctrl+c" {
@@ -877,14 +880,70 @@ func (m *Model) toggleFocus() {
 	}
 }
 
-// openSelectedChat opens whatever the sidebar selection points at.
+// openSelectedChat opens whatever the sidebar selection points at, then jumps to
+// the input so the user can immediately start typing.
 func (m Model) openSelectedChat() (tea.Model, tea.Cmd) {
 	if m.sidebarSel < 0 || m.sidebarSel >= len(m.chats) {
 		return m, nil
 	}
 	id := m.chats[m.sidebarSel].info.ID
 	cmd := m.openChat(id)
+	m.focus = focusInput
+	m.input.Focus()
 	return m, cmd
+}
+
+// handleMouse implements scroll-wheel scrolling of the message viewport and
+// click-to-select/open in the chat list (Textual-style mouse support). Only the
+// chat screen is interactive; other screens ignore the mouse.
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.screen != screenChat {
+		return m, nil
+	}
+
+	// Scroll wheel always scrolls the message viewport, regardless of focus.
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		m.viewport.LineUp(3)
+		return m, nil
+	case tea.MouseButtonWheelDown:
+		m.viewport.LineDown(3)
+		return m, nil
+	}
+
+	if msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+
+	// Click inside the sidebar column: figure out which chat row was hit.
+	if msg.X < m.sidebarW {
+		// First chat row = header height + banners + box top border + "chats"
+		// title + blank line (see sidebarView / chatView layout).
+		top := lipgloss.Height(m.headerView())
+		if b := m.maintenanceBanner(); b != "" {
+			top += lipgloss.Height(b)
+		}
+		if b := m.clientUpdateBanner(); b != "" {
+			top += lipgloss.Height(b)
+		}
+		firstItem := top + 1 + 2 // border + title + blank
+		if idx := msg.Y - firstItem; idx >= 0 && idx < len(m.chats) {
+			m.sidebarSel = idx
+			cmd := m.openChat(m.chats[idx].info.ID)
+			m.focus = focusInput
+			m.input.Focus()
+			return m, cmd
+		}
+		// Clicked empty sidebar space: just move focus there.
+		m.focus = focusSidebar
+		m.input.Blur()
+		return m, nil
+	}
+
+	// Click in the main pane: focus the input so the user can type.
+	m.focus = focusInput
+	m.input.Focus()
+	return m, nil
 }
 
 // openChat marks a chat active, clears its activity flag, refreshes the
@@ -918,6 +977,19 @@ func (m Model) submitInput() (tea.Model, tea.Cmd) {
 	return m, m.cmdSend(map[string]any{"cmd": "send", "chat": m.current, "text": line})
 }
 
+// groupTarget resolves the open chat as a group for an owner/group command.
+// Returns (id, "") when the open chat is a group, or ("", reason) to flash.
+func (m Model) groupTarget() (string, string) {
+	if m.current == "" {
+		return "", "open a group first (Tab to pick one)"
+	}
+	cs := m.chatByID[m.current]
+	if cs == nil || cs.info.Kind != "group" {
+		return "", "this command only works inside a group"
+	}
+	return m.current, ""
+}
+
 // runCommand parses and dispatches a slash command typed in the input box.
 func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(line)
@@ -940,14 +1012,90 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 		return m, m.cmdSend(map[string]any{"cmd": "start_dm", "username": args[0]})
 
 	case "/group":
-		if len(args) < 2 {
-			m.flash("usage: /group <name> <member1> <member2> ...", true)
+		if len(args) < 1 {
+			m.flash("usage: /group <name> [mode=open|approval|invite_only] [members...]", true)
+			return m, nil
+		}
+		// Optional `mode=<access>` token anywhere after the name; the rest are
+		// members to pre-add (an empty member list is fine for approval/invite).
+		mode := ""
+		members := []string{}
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "mode=") {
+				mode = strings.TrimPrefix(a, "mode=")
+			} else {
+				members = append(members, a)
+			}
+		}
+		cmd := map[string]any{"cmd": "create_group", "name": args[0], "members": members}
+		if mode != "" {
+			cmd["access_mode"] = mode
+		}
+		return m, m.cmdSend(cmd)
+
+	case "/join":
+		// /join <group-id> <key> <owner> — request access to a group you were
+		// invited to (the three parts make up the invite/group link).
+		if len(args) != 3 {
+			m.flash("usage: /join <group-id> <key> <owner>", true)
 			return m, nil
 		}
 		return m, m.cmdSend(map[string]any{
-			"cmd":     "create_group",
-			"name":    args[0],
-			"members": args[1:],
+			"cmd": "join_group", "group": args[0], "key": args[1], "owner": args[2],
+		})
+
+	case "/access":
+		if len(args) != 1 {
+			m.flash("usage: /access <open|approval|invite_only>", true)
+			return m, nil
+		}
+		id, e := m.groupTarget()
+		if e != "" {
+			m.flash(e, true)
+			return m, nil
+		}
+		return m, m.cmdSend(map[string]any{"cmd": "set_access", "group": id, "mode": args[0]})
+
+	case "/key", "/invitekey":
+		id, e := m.groupTarget()
+		if e != "" {
+			m.flash(e, true)
+			return m, nil
+		}
+		return m, m.cmdSend(map[string]any{"cmd": "group_info", "group": id})
+
+	case "/invite", "/accept", "/remove", "/ban", "/unban", "/unsuspend":
+		if len(args) != 1 {
+			m.flash("usage: "+cmd+" <user>", true)
+			return m, nil
+		}
+		id, e := m.groupTarget()
+		if e != "" {
+			m.flash(e, true)
+			return m, nil
+		}
+		ipcCmd := map[string]string{
+			"/invite":    "invite_member",
+			"/accept":    "accept_member",
+			"/remove":    "remove_member",
+			"/ban":       "ban_member",
+			"/unban":     "unban_member",
+			"/unsuspend": "unsuspend_member",
+		}[cmd]
+		return m, m.cmdSend(map[string]any{"cmd": ipcCmd, "group": id, "username": args[0]})
+
+	case "/suspend":
+		if len(args) != 2 {
+			m.flash("usage: /suspend <user> <duration>  (e.g. 30m, 2h, 1d)", true)
+			return m, nil
+		}
+		id, e := m.groupTarget()
+		if e != "" {
+			m.flash(e, true)
+			return m, nil
+		}
+		return m, m.cmdSend(map[string]any{
+			"cmd": "suspend_member", "group": id, "username": args[0], "duration": args[1],
 		})
 
 	case "/servers":

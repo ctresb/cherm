@@ -43,12 +43,67 @@ const DEFAULT_VERSION: &str = "0.1.0+dev";
 /// graceful update stop (install_specification §12.3).
 const DEFAULT_MAINTENANCE_WARNING: u64 = 60;
 
+/// Hard ceiling on concurrently-served connections. Each connection owns a task,
+/// a writer task, and a bounded channel; this caps total resource use and the
+/// number of in-flight pre-auth handshakes a flood can open. Excess connections
+/// are dropped immediately (the client may retry).
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Max simultaneous connections from a single source IP. Stops one host from
+/// monopolising the global pool (slowloris / connection-flood) while leaving room
+/// for legitimate NAT'd clients.
+const MAX_CONNECTIONS_PER_IP: usize = 64;
+
+/// Shared per-IP live-connection counter. An RAII [`IpGuard`] increments on accept
+/// and decrements on drop (connection end), so the map reflects only live links.
+type IpCounts = std::sync::Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// RAII decrementer for the per-IP counter: dropping it (when the connection task
+/// ends, however it ends) releases the IP's slot.
+struct IpGuard {
+    counts: IpCounts,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.counts.lock() {
+            if let Some(n) = map.get_mut(&self.ip) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
+/// Admit a connection from `ip` if it is under the per-IP cap, returning a guard
+/// that frees the slot on drop. Returns `None` (reject) when the cap is reached.
+fn admit_ip(counts: &IpCounts, ip: std::net::IpAddr) -> Option<IpGuard> {
+    let mut map = counts.lock().ok()?;
+    let n = map.entry(ip).or_insert(0);
+    if *n >= MAX_CONNECTIONS_PER_IP {
+        // Don't leave a zero-or-capped entry we just created lingering.
+        if *n == 0 {
+            map.remove(&ip);
+        }
+        return None;
+    }
+    *n += 1;
+    Some(IpGuard {
+        counts: counts.clone(),
+        ip,
+    })
+}
+
 /// Command-line configuration, parsed by hand (no clap dependency).
 struct Config {
     addr: String,
     db: String,
     no_attest: bool,
     release_secret: Option<String>,
+    release_secret_file: Option<String>,
     instance_key: Option<String>,
     version: Option<String>,
     config: Option<String>,
@@ -65,6 +120,7 @@ impl Config {
         let mut db = "cherm-server.db".to_string();
         let mut no_attest = false;
         let mut release_secret = None;
+        let mut release_secret_file = None;
         let mut instance_key = None;
         let mut version = None;
         let mut config = None;
@@ -84,6 +140,7 @@ impl Config {
                 }
                 "--no-attest" => no_attest = true,
                 "--release-secret" => release_secret = args.next(),
+                "--release-secret-file" => release_secret_file = args.next(),
                 "--instance-key" => instance_key = args.next(),
                 "--version" => version = args.next(),
                 "--config" => config = args.next(),
@@ -102,6 +159,7 @@ impl Config {
             db,
             no_attest,
             release_secret,
+            release_secret_file,
             instance_key,
             version,
             config,
@@ -120,6 +178,25 @@ impl Config {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join("instance.key"),
             _ => PathBuf::from("instance.key"),
         }
+    }
+
+    /// Resolve the release signing secret, preferring `--release-secret-file`
+    /// (read from a `0600` path) over `--release-secret`. The latter is exposed to
+    /// any local process via `/proc/<pid>/cmdline` / `ps`, so passing the
+    /// higher-value release key on argv is discouraged with a loud warning.
+    fn resolve_release_secret(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.release_secret_file {
+            let s = std::fs::read_to_string(path)
+                .with_context(|| format!("reading --release-secret-file {path}"))?;
+            return Ok(Some(s.trim().to_string()));
+        }
+        if self.release_secret.is_some() {
+            warn!(
+                "the release secret was passed on the command line; it is readable by other \
+                 local processes via /proc/<pid>/cmdline. Prefer --release-secret-file <path>."
+            );
+        }
+        Ok(self.release_secret.clone())
     }
 
     /// Resolve the advertised version: `--version`, else `$CHERM_VERSION`, else
@@ -147,9 +224,10 @@ async fn main() -> Result<()> {
     // Build the attestation signer (loads or generates the instance key).
     let instance_key_path = cfg.instance_key_path();
     let version = cfg.resolve_version();
+    let release_secret = cfg.resolve_release_secret()?;
     let attestor = attest::Attestor::new(
         &instance_key_path,
-        cfg.release_secret.as_deref(),
+        release_secret.as_deref(),
         version,
         cfg.no_attest,
     )
@@ -181,6 +259,9 @@ async fn main() -> Result<()> {
     let conn = db::open(&cfg.db).with_context(|| format!("opening database {}", cfg.db))?;
     let database: Db = Arc::new(Mutex::new(conn));
     let online: Online = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // Shared, per-target gate that bounds how fast any user's one-time keys can be
+    // consumed across ALL connections (anti OTK-drain DoS).
+    let fetch_gate = conn::new_fetch_gate();
 
     let listener = TcpListener::bind(&cfg.addr)
         .await
@@ -188,7 +269,11 @@ async fn main() -> Result<()> {
 
     // Startup banner (install_specification §11.4): clear enough for an operator
     // to confirm the server is running correctly. Logs go to stderr.
-    let tier = if attestor.no_attest() { "unsigned" } else { "software" };
+    let tier = if attestor.no_attest() {
+        "unsigned"
+    } else {
+        "software"
+    };
     info!(
         name = %server_config.name,
         version = %attestor.version(),
@@ -203,6 +288,11 @@ async fn main() -> Result<()> {
         "cherm relay listening"
     );
 
+    // Enforce the advertised offline-queue TTL: periodically delete outbox frames
+    // older than 72h so an undelivered queue (e.g. for puppet accounts that never
+    // log in) cannot pin disk indefinitely.
+    spawn_outbox_pruner(database.clone());
+
     // `draining` flips true during a maintenance window so the accept loop stops
     // admitting NEW connections while existing ones finish (install_specification
     // §12.2 "stop accepting new connections").
@@ -213,6 +303,11 @@ async fn main() -> Result<()> {
         attestor.version().to_string(),
         cfg.maintenance_warning,
     );
+
+    // Global connection ceiling + per-IP cap: bound total resource use and stop a
+    // single host from monopolising the pool (slowloris / connection flood).
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let ip_counts: IpCounts = Arc::new(Mutex::new(HashMap::new()));
 
     // Accept loop: a single misbehaving connection must never take down the
     // server, so per-connection work runs in its own task and accept errors are
@@ -231,13 +326,38 @@ async fn main() -> Result<()> {
             drop(stream);
             continue;
         }
+        // Global ceiling: drop (don't queue) when saturated. The permit is held for
+        // the connection's lifetime and released when its task ends.
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(%peer, "connection limit reached; dropping new connection");
+                drop(stream);
+                continue;
+            }
+        };
+        // Per-IP cap: one host can't exhaust the global pool. The guard frees the
+        // slot when the connection task ends.
+        let ip_guard = match admit_ip(&ip_counts, peer.ip()) {
+            Some(g) => g,
+            None => {
+                warn!(%peer, "per-IP connection limit reached; dropping");
+                drop(stream);
+                continue;
+            }
+        };
         let _ = stream.set_nodelay(true);
         let online = online.clone();
         let database = database.clone();
         let attestor = attestor.clone();
         let server_config = server_config.clone();
+        let fetch_gate = fetch_gate.clone();
         tokio::spawn(async move {
-            conn::handle(stream, peer, online, database, attestor, server_config).await;
+            // Hold the global permit + per-IP guard for the whole connection; both
+            // release on drop when `handle` returns (however it returns).
+            let _permit = permit;
+            let _ip_guard = ip_guard;
+            conn::handle(stream, peer, online, database, attestor, server_config, fetch_gate).await;
         });
     }
 }
@@ -282,7 +402,10 @@ fn spawn_maintenance_signal_handler(
             let count = {
                 let guard = online.lock().await;
                 for tx in guard.values() {
-                    let _ = tx.send(notice.clone());
+                    // Bounded channel: best-effort, non-blocking. We must NOT await a
+                    // send while holding the global online lock; a non-reading client
+                    // simply misses the notice (it is disconnected by the drain anyway).
+                    let _ = tx.try_send(notice.clone());
                 }
                 guard.len()
             };
@@ -301,6 +424,32 @@ fn spawn_maintenance_signal_handler(
     {
         let _ = (online, draining, version, warning_secs);
     }
+}
+
+/// Offline-queue retention (72h, matching the operator banner) and how often the
+/// pruner runs.
+const OUTBOX_TTL_MS: i64 = 72 * 3600 * 1000;
+const OUTBOX_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Spawn a background task that deletes outbox frames older than [`OUTBOX_TTL_MS`]
+/// on a fixed interval. The DB lock is held only for the brief DELETE.
+fn spawn_outbox_pruner(db: Db) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(OUTBOX_PRUNE_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = now_millis() - OUTBOX_TTL_MS;
+            let removed = {
+                let conn = db.lock().unwrap();
+                db::prune_expired(&conn, cutoff)
+            };
+            match removed {
+                Ok(n) if n > 0 => info!(rows = n, "pruned expired outbox frames"),
+                Ok(_) => {}
+                Err(e) => error!(error = %e, "outbox prune failed"),
+            }
+        }
+    });
 }
 
 /// Current unix time in milliseconds (mirrors `conn::now_millis`).

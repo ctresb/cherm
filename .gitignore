@@ -6,6 +6,16 @@
 /tui/cherm
 /tui/tui
 
+# Node
+node_modules/
+dist/
+build/
+.npm/
+.pnpm-store/
+.env
+.env.*
+!.env.example
+
 # Local runtime data
 *.db
 *.db-journal

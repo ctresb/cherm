@@ -236,10 +236,13 @@ func TestBubbleStaysWhiteAndBold(t *testing.T) {
 	}
 
 	out := renderMessage("you", 1700000000000, "secret", "", false, true, 0)
-	if !strings.Contains(out, "\x1b[1m") {
+	// Prefix is bold. The outgoing background band merges the bold attribute with
+	// the bg (e.g. "\x1b[1;48;2;...m"), so accept either standalone or combined.
+	if !strings.Contains(out, "\x1b[1m") && !strings.Contains(out, "\x1b[1;") {
 		t.Error("bubble prefix should be bold")
 	}
+	// No FOREGROUND color until premium (a background tint band is allowed).
 	if strings.Contains(out, "\x1b[38;2;") || strings.Contains(out, "\x1b[38;5;") {
-		t.Error("message bubble must be white (no color) until premium is enabled")
+		t.Error("message bubble must be white (no foreground color) until premium is enabled")
 	}
 }

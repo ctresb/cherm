@@ -55,9 +55,12 @@ var (
 var (
 	titleStyle lipgloss.Style
 
-	itemStyle     lipgloss.Style
-	selectedStyle lipgloss.Style
-	activityStyle lipgloss.Style
+	itemStyle       lipgloss.Style
+	dmGlyphStyle    lipgloss.Style
+	groupGlyphStyle lipgloss.Style
+	groupItemStyle  lipgloss.Style
+	selectedStyle   lipgloss.Style
+	activityStyle   lipgloss.Style
 
 	footerStyle lipgloss.Style
 	statusStyle lipgloss.Style
@@ -118,6 +121,11 @@ func applyPalette(p Palette) {
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(cMagenta)
 
 	itemStyle = lipgloss.NewStyle().Foreground(cWhite)
+	// dmGlyphStyle / groupGlyphStyle distinguish 1:1 chats (@, muted) from group
+	// rooms (#, accent) in the sidebar so the two are visually distinct at a glance.
+	dmGlyphStyle = lipgloss.NewStyle().Foreground(cMuted)
+	groupGlyphStyle = lipgloss.NewStyle().Foreground(cMagenta).Bold(true)
+	groupItemStyle = lipgloss.NewStyle().Foreground(cMagenta)
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(cDark).Background(cMagenta)
 	activityStyle = lipgloss.NewStyle().Foreground(cPink).Bold(true)
 

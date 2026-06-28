@@ -61,10 +61,19 @@ func renderMessage(label string, ts int64, body, color string, system, outgoing 
 		ps = ps.Foreground(c)
 		bs = bs.Foreground(c)
 	}
+	// Outgoing messages get a subtle background band. The background MUST be set
+	// on the inner (prefix + body) styles too, not just the outer box — otherwise
+	// only the trailing pad is tinted and the band looks broken (the glitch). With
+	// the bg on every styled segment, the whole row reads as one continuous band.
+	if outgoing && !system {
+		ps = ps.Background(cOutgoingBg)
+		bs = bs.Background(cOutgoingBg)
+	}
 	line := ps.Render(prefix) + bs.Render(body)
 
 	// Wrap to the viewport width so long messages break onto multiple lines
-	// instead of overflowing, and give outgoing messages a subtle background.
+	// instead of overflowing; the box background fills each wrapped row to the
+	// full width so the band is rectangular.
 	box := lipgloss.NewStyle()
 	if width > 0 {
 		box = box.Width(width)

@@ -164,8 +164,39 @@ fn verify_chain(
         let issuer_key = p384_from_cert(&path[i - 1])?;
         verify_cert_signed_by(&path[i], &issuer_key)?;
     }
+    // RFC 5280 path validation: every ISSUING (non-leaf) cert must actually be a CA
+    // (basicConstraints CA:TRUE). Without this an attacker who somehow obtained a
+    // non-CA end-entity cert under the pinned root could still chain a forged leaf
+    // beneath it. The leaf (NSM end-entity) is exempt.
+    for cert in &path[..path.len() - 1] {
+        require_ca(cert)?;
+    }
 
     p384_from_cert(path.last().unwrap())
+}
+
+/// OID 2.5.29.19 — X.509 basicConstraints extension.
+const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
+
+/// Require that `cert` carries basicConstraints with CA:TRUE (an issuing CA).
+fn require_ca(cert: &Certificate) -> Result<()> {
+    use x509_cert::ext::pkix::BasicConstraints;
+    let exts = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .ok_or_else(|| anyhow!("issuer cert has no extensions (missing basicConstraints)"))?;
+    for ext in exts {
+        if ext.extn_id.to_string() == OID_BASIC_CONSTRAINTS {
+            let bc = BasicConstraints::from_der(ext.extn_value.as_bytes())
+                .map_err(|e| anyhow!("basicConstraints decode: {e}"))?;
+            if !bc.ca {
+                bail!("issuer cert is not a CA (basicConstraints CA:FALSE)");
+            }
+            return Ok(());
+        }
+    }
+    bail!("issuer cert lacks basicConstraints CA:TRUE")
 }
 
 fn verify_cert_signed_by(child: &Certificate, issuer_key: &VerifyingKey) -> Result<()> {
@@ -281,7 +312,14 @@ mod tests {
 
     #[test]
     fn garbage_quote_is_rejected() {
-        let err = verify(&[0, 1, 2, 3], None, b"n", 1_700_000_000_000, &[vec![0u8]], None);
+        let err = verify(
+            &[0, 1, 2, 3],
+            None,
+            b"n",
+            1_700_000_000_000,
+            &[vec![0u8]],
+            None,
+        );
         assert!(err.is_err());
     }
 

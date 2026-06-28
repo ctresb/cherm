@@ -23,6 +23,20 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Maximum accepted frame size (16 MiB) — guards against memory-exhaustion.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Maximum accepted size of a relayed ciphertext `payload` (base64), well below
+/// [`MAX_FRAME`]. Every legitimate Olm/Megolm payload — a chat message, a system
+/// notice, or a group-key share carrying the roster — is far smaller than this.
+/// Capping it bounds the per-message memory a relay must queue per recipient and
+/// removes a 16 MiB-per-message amplification vector (a slow/offline recipient
+/// could otherwise be made to buffer many near-`MAX_FRAME` blobs).
+pub const MAX_PAYLOAD: usize = 128 * 1024;
+
+/// Maximum number of recipients a single `Send` may fan out to. A group broadcast
+/// legitimately lists its whole roster here; this caps the per-`Send` work (and
+/// thus the amplification an authenticated sender can force from one rate-limited
+/// action) while staying comfortably above any realistic group size.
+pub const MAX_RECIPIENTS: usize = 1024;
+
 /// Constraints on usernames (requirements 8 & 9).
 pub const USERNAME_MAX: usize = 16;
 
@@ -48,6 +62,54 @@ pub fn is_reserved_username(name: &str) -> bool {
 /// True if `name` is a valid AND non-reserved username (the rule for registration).
 pub fn is_registerable_username(name: &str) -> bool {
     valid_username(name) && !is_reserved_username(name)
+}
+
+/// Group access modes (group access control). Stored per group in the owner's
+/// vault and mirrored to members in the Megolm key-share so every client can
+/// display the mode. Enforcement is owner-side: the owner decides whether to
+/// hand out the Megolm key, which is the real gate — not the group key itself.
+pub mod access_mode {
+    /// Anyone with a valid invite/group key joins immediately, no approval.
+    pub const OPEN: &str = "open";
+    /// Anyone with a valid key may *request* to join; the owner must accept them
+    /// (`/accept <username>`) before they are added.
+    pub const APPROVAL: &str = "approval";
+    /// Only the owner can add users (by username); a valid key alone never joins.
+    pub const INVITE_ONLY: &str = "invite_only";
+
+    /// All recognized modes, for validation + UIs.
+    pub const ALL: &[&str] = &[OPEN, APPROVAL, INVITE_ONLY];
+
+    /// True if `m` is a recognized access mode.
+    pub fn valid(m: &str) -> bool {
+        ALL.contains(&m)
+    }
+}
+
+/// Logical `msg_type` strings exchanged in [`ClientMsg::Send`] / [`ServerMsg::Deliver`].
+/// The relay treats every one as opaque routing metadata; only clients interpret
+/// the (encrypted) payloads. The group-control types ride the same envelope so no
+/// server change is needed to add group access control.
+pub mod msgtype {
+    /// A 1:1 Olm message; plaintext is the chat text.
+    pub const OLM: &str = "olm";
+    /// An Olm message whose plaintext is a Megolm group-key share (JSON).
+    pub const OLM_GROUP_KEY: &str = "olm_group_key";
+    /// A 1:1 "left the chat" notice over Olm.
+    pub const OLM_SYSTEM: &str = "olm_system";
+    /// A Megolm group message; plaintext is the chat text.
+    pub const MEGOLM: &str = "megolm";
+    /// A group "left the chat" notice over Megolm.
+    pub const MEGOLM_SYSTEM: &str = "megolm_system";
+    /// A join request a prospective member sends (Olm) to the group owner;
+    /// plaintext is `{group_id, group_key}`.
+    pub const GROUP_JOIN: &str = "group_join";
+    /// The owner's reply (Olm) denying a join, with a human-readable reason;
+    /// plaintext is `{group_id, reason}`.
+    pub const GROUP_JOIN_DENIED: &str = "group_join_denied";
+    /// A moderation/membership event the owner broadcasts (Megolm) to the group;
+    /// plaintext is `{kind, who, ...}` (see core::net).
+    pub const GROUP_EVENT: &str = "group_event";
 }
 
 /// One published one-time prekey: an id and its base64 Curve25519 public key.
@@ -196,6 +258,7 @@ pub mod errcode {
     pub const NO_PREKEYS: &str = "no_prekeys";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const NOT_AUTHENTICATED: &str = "not_authenticated";
+    pub const ALREADY_AUTHENTICATED: &str = "already_authenticated";
     pub const BAD_REQUEST: &str = "bad_request";
     pub const INTERNAL: &str = "internal";
 }
@@ -236,9 +299,22 @@ where
             "frame too large",
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    // Read the body INCREMENTALLY (bounded by the declared length) instead of
+    // allocating `len` bytes up front. A peer that sends a huge length prefix but
+    // then stalls/dribbles otherwise pins up to MAX_FRAME (16 MiB) of zeroed heap
+    // per connection before a single body byte arrives; with `take` + read_to_end
+    // the buffer only grows as bytes actually arrive (and the caller's read
+    // deadline tears down a stalled connection).
+    let mut buf = Vec::new();
+    let read = r.take(len as u64).read_to_end(&mut buf).await?;
+    if read != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "frame body shorter than its length prefix",
+        ));
+    }
+    serde_json::from_slice(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -268,6 +344,17 @@ mod tests {
         assert!(is_registerable_username("alice"));
         // valid charset but reserved:
         assert!(valid_username("system") && !is_registerable_username("system"));
+    }
+
+    #[test]
+    fn access_modes() {
+        assert!(access_mode::valid("open"));
+        assert!(access_mode::valid("approval"));
+        assert!(access_mode::valid("invite_only"));
+        assert!(!access_mode::valid("public"));
+        assert!(!access_mode::valid("Open")); // case-sensitive
+        assert!(!access_mode::valid(""));
+        assert_eq!(access_mode::ALL.len(), 3);
     }
 
     #[tokio::test]

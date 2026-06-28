@@ -14,14 +14,13 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, Rng, RngCore};
+use zeroize::Zeroizing;
 use vodozemac::megolm::{
-    GroupSession, GroupSessionPickle, InboundGroupSession, InboundGroupSessionPickle, MegolmMessage,
-    SessionConfig as MegolmConfig, SessionKey,
+    GroupSession, GroupSessionPickle, InboundGroupSession, InboundGroupSessionPickle,
+    MegolmMessage, SessionConfig as MegolmConfig, SessionKey,
 };
-use vodozemac::olm::{
-    Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle,
-};
+use vodozemac::olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 
 const PICKLE_NONCE: usize = 24;
@@ -113,7 +112,12 @@ impl Device {
             .account
             .create_inbound_session(SessionConfig::version_1(), id, &pre)
             .map_err(|e| anyhow!("inbound session: {e}"))?;
-        Ok((OlmSession { session: res.session }, res.plaintext))
+        Ok((
+            OlmSession {
+                session: res.session,
+            },
+            res.plaintext,
+        ))
     }
 
     /// Export the FULL identity (including the private keys) as a portable JSON
@@ -133,7 +137,7 @@ impl Device {
 
     /// Encrypt this account to an at-rest pickle blob.
     pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        encrypt_blob(key, &serde_json::to_vec(&self.account.pickle())?)
+        encrypt_blob(key, &Zeroizing::new(serde_json::to_vec(&self.account.pickle())?))
     }
 
     /// Restore an account from an at-rest pickle blob.
@@ -197,7 +201,7 @@ impl OlmSession {
     }
 
     pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+        encrypt_blob(key, &Zeroizing::new(serde_json::to_vec(&self.session.pickle())?))
     }
 
     pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
@@ -245,7 +249,7 @@ impl GroupSender {
     }
 
     pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+        encrypt_blob(key, &Zeroizing::new(serde_json::to_vec(&self.session.pickle())?))
     }
 
     pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
@@ -292,7 +296,7 @@ impl GroupReceiver {
     }
 
     pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
-        encrypt_blob(key, &serde_json::to_vec(&self.session.pickle())?)
+        encrypt_blob(key, &Zeroizing::new(serde_json::to_vec(&self.session.pickle())?))
     }
 
     pub fn from_pickle_encrypted(key: &[u8; 32], blob: &[u8]) -> Result<Self> {
@@ -334,19 +338,40 @@ pub fn write_secret_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // SYMLINK / TOCTOU HARDENING: a local attacker who can pre-create the key
+        // path (or a permissive/symlinked file there) must not be able to redirect
+        // our secret write to a file they control, nor have us follow a symlink to
+        // a sensitive target and truncate it. Two layers:
+        //   1. Reject an existing symlink up front (`symlink_metadata` does NOT
+        //      follow links, so this sees the link itself).
+        //   2. Open with `O_NOFOLLOW` so the kernel refuses to follow a symlink in
+        //      the FINAL path component even under a race after the check.
+        // The parent dir is created 0700 above; together this closes the
+        // "pre-place a symlink at the secret path" attack.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write secret to {}: path is a symlink (possible tampering)",
+                    path.display()
+                );
+            }
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .with_context(|| format!("creating {}", path.display()))?;
         f.write_all(data)?;
         f.flush()?;
-        // Normalize the mode even if the file pre-existed with looser perms, and
-        // FAIL if owner-only cannot be enforced (don't silently leave a secret
-        // world-readable).
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        // Normalize the mode (in case the file pre-existed with looser perms) via
+        // the OPEN FILE DESCRIPTOR (fchmod), not a path-based set_permissions —
+        // the latter re-resolves `path` and would follow a symlink swapped in after
+        // our O_NOFOLLOW open. FAIL if owner-only can't be enforced rather than
+        // silently leave a secret world-readable.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("enforcing 0600 on {}", path.display()))?;
     }
     #[cfg(not(unix))]
@@ -359,6 +384,47 @@ pub fn gen_master_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     OsRng.fill_bytes(&mut k);
     k
+}
+
+// ===========================================================================
+// Group invite/access keys
+// ===========================================================================
+//
+// A group key is a short, stable, human-shareable handle for a group on a
+// server (an "invite/group link"). It is NOT a secret token: access is gated by
+// who the owner shares the Megolm session key with (see core::net), so knowing a
+// group key alone never grants access to a banned/unapproved user. Uniqueness is
+// enforced by the vault `groups.group_key` UNIQUE constraint plus collision
+// retry; this module only mints + validates the character shape.
+
+/// Charset for group keys: `A-Z`, `a-z`, `0-9` (62 symbols).
+const GROUP_KEY_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Length of a group invite/access key.
+pub const GROUP_KEY_LEN: usize = 8;
+
+/// Generate a random alphanumeric code of length `tamanho` from the group-key
+/// charset (`A-Z`, `a-z`, `0-9`). Uses the OS CSPRNG.
+pub fn gerar_codigo(tamanho: usize) -> String {
+    let mut rng = OsRng;
+    (0..tamanho)
+        .map(|_| {
+            let idx = rng.gen_range(0..GROUP_KEY_CHARSET.len());
+            GROUP_KEY_CHARSET[idx] as char
+        })
+        .collect()
+}
+
+/// Mint a fresh 8-char group key. Uniqueness across groups is the caller's job
+/// (DB UNIQUE + retry); this just produces a syntactically valid candidate.
+pub fn gen_group_key() -> String {
+    gerar_codigo(GROUP_KEY_LEN)
+}
+
+/// True if `s` is a syntactically valid group key: exactly [`GROUP_KEY_LEN`]
+/// chars, each in `[A-Za-z0-9]`.
+pub fn valid_group_key(s: &str) -> bool {
+    s.len() == GROUP_KEY_LEN && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// A stable server id (hex BLAKE3 of the server address) used as the vault
@@ -376,8 +442,10 @@ pub fn derive_vault_key(master: &[u8; 32], server_id: &str) -> [u8; 32] {
 }
 
 /// SQLCipher raw-key form (`x'<hex>'`) of a 32-byte vault key, for `PRAGMA key`.
-pub fn vault_key_sqlcipher(key: &[u8; 32]) -> String {
-    format!("x'{}'", hex::encode(key))
+/// Returned in a [`Zeroizing`] wrapper so the hex (which embeds the raw key) is
+/// wiped on drop instead of lingering in freed heap.
+pub fn vault_key_sqlcipher(key: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(format!("x'{}'", hex::encode(key)))
 }
 
 // ===========================================================================
@@ -397,14 +465,21 @@ fn encrypt_blob(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decrypt_blob(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_blob(key: &[u8; 32], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if blob.len() < PICKLE_NONCE {
         return Err(anyhow!("blob too short"));
     }
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("cipher: {e}"))?;
-    cipher
-        .decrypt(XNonce::from_slice(&blob[..PICKLE_NONCE]), &blob[PICKLE_NONCE..])
-        .map_err(|e| anyhow!("decrypt (wrong key or tampered): {e}"))
+    // The decrypted plaintext is a private-key pickle (device / Olm / Megolm
+    // secrets). Wrap it so the buffer is wiped on drop instead of lingering in
+    // freed heap (cold-boot / core-dump / swap exposure in the local-attacker model).
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&blob[..PICKLE_NONCE]),
+            &blob[PICKLE_NONCE..],
+        )
+        .map_err(|e| anyhow!("decrypt (wrong key or tampered): {e}"))?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Verify a base64 Ed25519 signature against a base64 Ed25519 public key.
@@ -429,6 +504,43 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_key_shape() {
+        // Every minted key is exactly 8 chars and alphanumeric, over many tries.
+        for _ in 0..2000 {
+            let k = gen_group_key();
+            assert_eq!(k.len(), GROUP_KEY_LEN, "key {k:?} must be 8 chars");
+            assert!(valid_group_key(&k), "minted key {k:?} must validate");
+            assert!(k.bytes().all(|b| b.is_ascii_alphanumeric()));
+        }
+        // Validation rejects the wrong length / charset.
+        assert!(valid_group_key("Ab3xZ9q0"));
+        assert!(!valid_group_key("short")); // 5 chars
+        assert!(!valid_group_key("toolongkey")); // 10 chars
+        assert!(!valid_group_key("abcdef!@")); // punctuation
+        assert!(!valid_group_key("abcd efg")); // space
+        assert!(!valid_group_key("")); // empty
+    }
+
+    #[test]
+    fn group_keys_are_well_distributed() {
+        use std::collections::HashSet;
+        // 8-char base62 has 62^8 ≈ 2.18e14 values, so 5000 draws should collide
+        // essentially never — a sanity check that the generator isn't degenerate.
+        let mut seen = HashSet::new();
+        for _ in 0..5000 {
+            seen.insert(gen_group_key());
+        }
+        assert!(seen.len() > 4990, "generator produced too many collisions");
+    }
+
+    #[test]
+    fn gerar_codigo_honours_length() {
+        for n in [0usize, 1, 4, 8, 16, 32] {
+            assert_eq!(gerar_codigo(n).chars().count(), n);
+        }
+    }
 
     #[test]
     fn olm_dm_roundtrip() {
@@ -502,6 +614,42 @@ mod tests {
         // wrong key fails
         let bad = gen_master_key();
         assert!(Device::from_pickle_encrypted(&bad, &blob).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_refuses_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cherm-secret-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("attacker-target");
+        std::fs::write(&target, b"victim").unwrap();
+        let link = dir.join("instance.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Writing the secret through a symlink must be refused, and the symlink's
+        // target must remain untouched (not truncated / overwritten).
+        let err = write_secret_file(&link, b"TOP-SECRET-KEY");
+        assert!(err.is_err(), "must refuse to write through a symlink");
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim", "target untouched");
+
+        // A normal (non-symlink) path still writes 0600.
+        let real = dir.join("real.key");
+        write_secret_file(&real, b"ok").unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"ok");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret file must be owner-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(test)]
+    fn uuid_like() -> String {
+        // Avoid pulling uuid into this crate's tests; a process+addr nonce suffices
+        // for a unique temp dir name.
+        let x = Box::new(0u8);
+        format!("{:p}", &*x)
+            .trim_start_matches("0x")
+            .to_string()
     }
 
     #[test]

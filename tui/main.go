@@ -40,7 +40,9 @@ func main() {
 	core := NewCore()
 	model := NewModel(core)
 
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	// AltScreen for a full-screen app; mouse cell-motion enables scroll-wheel
+	// scrolling and click-to-select in the chat list.
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Wire the program so the core's reader goroutine can deliver events, then
 	// start the subprocess. Starting before Run lets us fail loudly (outside the

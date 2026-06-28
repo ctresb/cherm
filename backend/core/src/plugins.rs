@@ -35,6 +35,36 @@ use crate::ipc::Events;
 /// Default official store base. Overridable for testing via `CHERM_PLUGINS_URL`.
 const DEFAULT_STORE: &str = "https://plugins.cherm.chat";
 
+/// Network timeouts for store/update HTTP. Without these a network attacker (or a
+/// dead store) that completes the TCP handshake but never sends data wedges the
+/// ENTIRE core, which dispatches commands sequentially and awaits each inline.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Max bytes we will read from a store/manifest/package response. The declarative
+/// plugin format is tiny; this caps a compromised store from OOM-ing the core with
+/// a multi-GB body.
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_PACKAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a response body with a hard byte cap (rejecting an over-large or lying
+/// `Content-Length`, and streaming so a chunked body can't exceed the cap either).
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max {
+            bail!("response too large ({len} bytes > {max})");
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| anyhow!("read body: {e}"))? {
+        if buf.len() + chunk.len() > max {
+            bail!("response exceeded {max} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 // ===========================================================================
 // Permission model — deny by default
 // ===========================================================================
@@ -113,7 +143,9 @@ pub fn validate_permissions(perms: &[String]) -> Result<()> {
         }
         // No wallet permission outside the read-only allow-list, ever.
         if p.starts_with("wallet.") && !ALLOWED_PERMISSIONS.contains(&p) {
-            bail!("wallet permission '{p}' is not allowed — wallet access is read-only and limited");
+            bail!(
+                "wallet permission '{p}' is not allowed — wallet access is read-only and limited"
+            );
         }
         if !ALLOWED_PERMISSIONS.contains(&p) {
             bail!("permission '{p}' is not recognised");
@@ -251,6 +283,8 @@ impl Plugins {
             .unwrap_or_else(|| DEFAULT_STORE.to_string());
         let http = reqwest::Client::builder()
             .user_agent(concat!("cherm-core/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_TIMEOUT)
             .build()
             .unwrap_or_default();
         Plugins {
@@ -272,8 +306,16 @@ impl Plugins {
     fn active_widgets_path(&self) -> PathBuf {
         self.dir.join("active-widgets.json")
     }
-    fn plugin_dir(&self, name: &str) -> PathBuf {
-        self.dir.join(sanitize(name))
+    /// The on-disk directory for a plugin. FALLIBLE: names like `...`, `///`, or
+    /// `--` sanitize to an empty segment, and `self.dir.join("")` is the plugins
+    /// ROOT — a later `remove_dir_all` on that would wipe every plugin + the index.
+    /// Reject an empty-sanitized name so the path is always a strict child.
+    fn plugin_dir(&self, name: &str) -> Result<PathBuf> {
+        let seg = sanitize(name);
+        if seg.is_empty() {
+            bail!("invalid plugin name {name:?}");
+        }
+        Ok(self.dir.join(seg))
     }
 
     fn load_installed(&self) -> InstalledIndex {
@@ -313,7 +355,11 @@ impl Plugins {
     pub async fn list_store(&self) -> Result<()> {
         let url = format!("{}/index", self.store);
         let idx: StoreIndex = match self.http.get(&url).send().await {
-            Ok(r) => r.json().await.unwrap_or_default(),
+            Ok(r) => read_capped(r, MAX_MANIFEST_BYTES)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default(),
             Err(e) => {
                 self.events.emit(json!({
                     "event": "error", "code": "store_unreachable",
@@ -355,19 +401,46 @@ impl Plugins {
     /// activate it (apply its theme/widgets) and surface the result.
     pub async fn install(&self, name: &str) -> Result<()> {
         let name = name.trim();
+        // Reject a name that doesn't map to a safe path segment up front (so we
+        // never write into / later remove the plugins ROOT).
+        let pdir = match self.plugin_dir(name) {
+            Ok(p) => p,
+            Err(_) => {
+                self.events.emit(json!({
+                    "event": "error", "code": "plugin_rejected",
+                    "message": format!("invalid plugin name {name:?}")
+                }));
+                return Ok(());
+            }
+        };
         // 1. Fetch the manifest from the store (authoritative category).
         let manifest_url = format!("{}/{}/manifest", self.store, sanitize(name));
-        let manifest: Manifest = self
-            .http
-            .get(&manifest_url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("fetch manifest: {e}"))?
-            .json()
-            .await
+        let manifest_bytes = read_capped(
+            self.http
+                .get(&manifest_url)
+                .send()
+                .await
+                .map_err(|e| anyhow!("fetch manifest: {e}"))?,
+            MAX_MANIFEST_BYTES,
+        )
+        .await
+        .map_err(|e| anyhow!("read manifest: {e}"))?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|e| anyhow!("parse manifest: {e}"))?;
 
-        // 2. Permission gate (defense in depth — the store also enforces this).
+        // 2. Bind the manifest to what we asked for: a store/CDN response for some
+        // OTHER plugin must not be installed under (or overwrite the record of) the
+        // requested name. The package/dir/record are all keyed on the requested
+        // name, so the manifest's own name must match it.
+        if manifest.name.trim() != name {
+            self.events.emit(json!({
+                "event": "error", "code": "plugin_rejected",
+                "message": format!("store returned a manifest for {:?}, not {name:?}", manifest.name)
+            }));
+            return Ok(());
+        }
+
+        // 3. Permission gate (defense in depth — the store also enforces this).
         if let Err(e) = validate_permissions(&manifest.permissions) {
             self.events.emit(json!({
                 "event": "error", "code": "plugin_rejected",
@@ -376,17 +449,18 @@ impl Plugins {
             return Ok(());
         }
 
-        // 3. Download the package and verify its SHA-256 against the manifest.
+        // 4. Download the package and verify its SHA-256 against the manifest.
         let package_url = format!("{}/{}/package", self.store, sanitize(name));
-        let bytes = self
-            .http
-            .get(&package_url)
-            .send()
-            .await
-            .map_err(|e| anyhow!("fetch package: {e}"))?
-            .bytes()
-            .await
-            .map_err(|e| anyhow!("read package: {e}"))?;
+        let bytes = read_capped(
+            self.http
+                .get(&package_url)
+                .send()
+                .await
+                .map_err(|e| anyhow!("fetch package: {e}"))?,
+            MAX_PACKAGE_BYTES,
+        )
+        .await
+        .map_err(|e| anyhow!("read package: {e}"))?;
         let got = hex::encode(Sha256::digest(&bytes));
         // A manifest with no checksum cannot be verified — refuse to install it
         // rather than fall through (an empty hash must never bypass the check).
@@ -406,13 +480,15 @@ impl Plugins {
         }
         // Validate the package parses into the known declarative shape before we
         // store it (rejects garbage / non-conforming payloads).
-        let _package: Package = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow!("parse package: {e}"))?;
+        let _package: Package =
+            serde_json::from_slice(&bytes).map_err(|e| anyhow!("parse package: {e}"))?;
 
-        // 4. Persist verified files under the plugin dir.
-        let pdir = self.plugin_dir(name);
+        // 5. Persist verified files under the plugin dir (validated above).
         std::fs::create_dir_all(&pdir)?;
-        std::fs::write(pdir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+        std::fs::write(
+            pdir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
         std::fs::write(pdir.join("package.json"), &bytes)?;
 
         // 5. Record install (replacing any previous version).
@@ -453,7 +529,11 @@ impl Plugins {
             }));
             return Ok(());
         }
-        let _ = std::fs::remove_dir_all(self.plugin_dir(name));
+        // Only remove a VALID per-plugin directory; never let an empty-sanitized
+        // name resolve to the plugins root and wipe everything.
+        if let Ok(pdir) = self.plugin_dir(name) {
+            let _ = std::fs::remove_dir_all(pdir);
+        }
         self.save_installed(&idx)?;
         self.apply_active(&idx)?;
         self.events
@@ -476,7 +556,12 @@ impl Plugins {
                 if let Some(t) = pkg.theme {
                     palette = Some(t);
                 }
-                widgets.extend(pkg.widgets);
+                // Sanitize store-controlled widget strings before they reach the TUI.
+                widgets.extend(pkg.widgets.into_iter().map(|mut w| {
+                    w.value = w.value.map(|v| clean_display(&v, 256));
+                    w.format = w.format.map(|v| clean_display(&v, 64));
+                    w
+                }));
             }
         }
 
@@ -488,17 +573,21 @@ impl Plugins {
             }
             None => {
                 let _ = std::fs::remove_file(self.active_theme_path());
-                self.events.emit(json!({"event": "theme", "palette": Value::Null}));
+                self.events
+                    .emit(json!({"event": "theme", "palette": Value::Null}));
             }
         }
-        std::fs::write(self.active_widgets_path(), serde_json::to_vec_pretty(&widgets)?)?;
+        std::fs::write(
+            self.active_widgets_path(),
+            serde_json::to_vec_pretty(&widgets)?,
+        )?;
         self.events
             .emit(json!({"event": "widgets", "widgets": widgets}));
         Ok(())
     }
 
     fn load_package(&self, name: &str) -> Result<Package> {
-        let s = std::fs::read_to_string(self.plugin_dir(name).join("package.json"))?;
+        let s = std::fs::read_to_string(self.plugin_dir(name)?.join("package.json"))?;
         Ok(serde_json::from_str(&s)?)
     }
 
@@ -510,8 +599,11 @@ impl Plugins {
         for p in &idx.plugins {
             let url = format!("{}/{}/manifest", self.store, sanitize(&p.manifest.name));
             let latest: Manifest = match self.http.get(&url).send().await {
-                Ok(r) => match r.json().await {
-                    Ok(m) => m,
+                Ok(r) => match read_capped(r, MAX_MANIFEST_BYTES).await {
+                    Ok(b) => match serde_json::from_slice(&b) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    },
                     Err(_) => continue,
                 },
                 Err(_) => continue,
@@ -612,16 +704,18 @@ fn manifest_to_value(m: &Manifest, installed: &InstalledIndex) -> Value {
         .iter()
         .map(|p| json!({"id": p, "help": permission_help(p)}))
         .collect();
+    // Sanitize every store-controlled display string (terminal-escape injection).
+    let disp = |s: &str, max: usize| clean_display(s, max);
     json!({
-        "name": m.name,
-        "display_name": if m.display_name.is_empty() { m.name.clone() } else { m.display_name.clone() },
-        "version": m.version,
-        "kind": m.kind,
-        "category": m.category,
-        "description": m.description,
-        "author": m.author,
-        "license": m.license,
-        "source_url": m.source_url,
+        "name": disp(&m.name, 64),
+        "display_name": if m.display_name.is_empty() { disp(&m.name, 64) } else { disp(&m.display_name, 64) },
+        "version": disp(&m.version, 32),
+        "kind": disp(&m.kind, 32),
+        "category": disp(&m.category, 32),
+        "description": disp(&m.description, 2000),
+        "author": disp(&m.author, 128),
+        "license": disp(&m.license, 64),
+        "source_url": disp(&m.source_url, 512),
         "permissions": perms,
         "installed": is_installed,
     })
@@ -631,7 +725,12 @@ fn manifest_to_value(m: &Manifest, installed: &InstalledIndex) -> Value {
 /// the file is always complete.
 fn theme_to_palette(t: &Theme) -> Value {
     // Defaults mirror tui/styles.go so an incomplete theme still renders sanely.
-    let pick = |o: &Option<String>, def: &str| o.clone().unwrap_or_else(|| def.to_string());
+    // Only accept strict #RRGGBB; an untrusted plugin color must never carry an
+    // escape sequence through to the terminal.
+    let pick = |o: &Option<String>, def: &str| match o {
+        Some(v) => clean_hex(v, def),
+        None => def.to_string(),
+    };
     json!({
         "magenta": pick(&t.magenta, "#EE00FF"),
         "pink":    pick(&t.pink,    "#FF007B"),
@@ -662,6 +761,37 @@ pub fn is_newer(a: &str, b: &str) -> bool {
         }
     }
     false
+}
+
+/// Strip terminal-dangerous bytes from a STORE-CONTROLLED display string before it
+/// crosses to the TUI. The Go TUI renders these via lipgloss, which does not strip
+/// embedded ANSI/OSC escapes (and width-based truncation treats them as zero-width,
+/// so they survive). A malicious submission could otherwise smuggle e.g. an OSC 52
+/// clipboard-write or screen-clear sequence that fires for anyone who merely opens
+/// the plugin store. We drop C0 controls (incl. ESC 0x1B), DEL, and C1 (0x80-0x9F)
+/// and bound the length.
+fn clean_display(s: &str, max: usize) -> String {
+    s.chars()
+        .filter(|c| {
+            let u = *c as u32;
+            !(u < 0x20 || u == 0x7f || (0x80..=0x9f).contains(&u))
+        })
+        .take(max)
+        .collect()
+}
+
+/// Accept only a strict `#RRGGBB` hex color; anything else (incl. escape payloads)
+/// falls back to the provided default. Theme colors come from untrusted plugins and
+/// are forwarded to the TUI verbatim otherwise.
+fn clean_hex(s: &str, def: &str) -> String {
+    let ok = s.len() == 7
+        && s.as_bytes()[0] == b'#'
+        && s.as_bytes()[1..].iter().all(|b| b.is_ascii_hexdigit());
+    if ok {
+        s.to_string()
+    } else {
+        def.to_string()
+    }
 }
 
 /// Keep a plugin name to a safe path segment ([a-z0-9._-]); never traverses.
@@ -712,5 +842,37 @@ mod tests {
         assert_eq!(sanitize("pastel-theme"), "pastel-theme");
         assert_eq!(sanitize("../../etc/passwd"), "etc-passwd");
         assert_eq!(sanitize("Foo Bar"), "foo-bar");
+    }
+
+    #[test]
+    fn sanitize_can_be_empty_for_pathological_names() {
+        // These must sanitize to "" so plugin_dir() rejects them — otherwise
+        // plugin_dir would resolve to the plugins ROOT and a later remove_dir_all
+        // would wipe everything.
+        for n in ["", "...", "---", "///", "___", ".-_"] {
+            assert!(sanitize(n).is_empty(), "{n:?} must sanitize to empty");
+        }
+    }
+
+    #[test]
+    fn clean_display_strips_escapes() {
+        // ESC, OSC payloads, C1 and DEL must be removed; printable text survives.
+        let evil = "ok\x1b]52;c;BASE64\x07\u{9b}2J\x7fend";
+        let cleaned = clean_display(evil, 1000);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\x07'));
+        assert!(!cleaned.contains('\u{9b}'));
+        assert!(!cleaned.contains('\x7f'));
+        assert_eq!(cleaned, "ok]52;c;BASE642Jend");
+        assert_eq!(clean_display("abcdef", 3), "abc"); // length bound
+    }
+
+    #[test]
+    fn clean_hex_accepts_only_strict_colors() {
+        assert_eq!(clean_hex("#EE00FF", "#000000"), "#EE00FF");
+        assert_eq!(clean_hex("#abc", "#000000"), "#000000"); // too short
+        assert_eq!(clean_hex("#GG00FF", "#000000"), "#000000"); // non-hex
+        assert_eq!(clean_hex("#EE00FF\x1b[2J", "#000000"), "#000000"); // escape payload
+        assert_eq!(clean_hex("red", "#000000"), "#000000");
     }
 }

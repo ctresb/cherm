@@ -11,8 +11,12 @@ use crate::{b64_decode, b64_encode};
 pub const PUBLIC_CODEBASE_URL: &str = "https://github.com/cherm-chat/cherm";
 pub const SIGNATURES_URL: &str = "https://cherm.chat/signatures";
 
-/// DEV-ONLY release keypair. Production servers are signed by the real project
-/// key; this exists only so local builds demonstrate the software tier.
+/// DEV-ONLY release keypair. Its SECRET is committed in this repo, so it must
+/// NEVER be a trust anchor in a release build — anyone could forge an "official"
+/// release signature with it. [`pinned`] therefore trusts this public key ONLY
+/// in debug builds (local demos). Production servers sign with the real project
+/// key (secret kept offline); clients trust it via `CHERM_RELEASE_PUBS` baked in
+/// at build time, or the `CHERM_OFFICIAL_RELEASE_PUBS` runtime override.
 pub const DEV_RELEASE_PUBLIC_B64: &str = "rP8FiokGtvgz/SsImR73QCYo8fL5tAbw333dA5tUNJ8=";
 pub const DEV_RELEASE_SECRET_B64: &str = "IwAL8LHaDW6SOrgkBVl0FUUuYXsZgcGJJb4PLIf7Fss=";
 
@@ -40,17 +44,46 @@ pub fn key_id_of(pub_b64: &str) -> String {
     }
 }
 
-/// Build the pinned trust set (dev defaults + env overrides).
-pub fn pinned() -> Official {
-    let mut release_pubkeys = vec![(key_id_of(DEV_RELEASE_PUBLIC_B64), DEV_RELEASE_PUBLIC_B64.to_string())];
-    if let Ok(extra) = std::env::var("CHERM_OFFICIAL_RELEASE_PUBS") {
-        for p in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            release_pubkeys.push((key_id_of(p), p.to_string()));
+/// Add every comma-separated base64 key in `raw` to `list` (deduped by key id).
+fn add_keys(raw: &str, list: &mut Vec<(String, String)>) {
+    for p in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let id = key_id_of(p);
+        if !id.is_empty() && !list.iter().any(|(eid, _)| eid == &id) {
+            list.push((id, p.to_string()));
         }
     }
+}
 
-    let official_build_hash = std::env::var("CHERM_OFFICIAL_HASH").ok().filter(|s| !s.is_empty());
-    let nitro_pcr0 = std::env::var("CHERM_OFFICIAL_PCR0").ok().filter(|s| !s.is_empty());
+/// Build the pinned trust set.
+///
+/// SECURITY: the committed dev release key is trusted ONLY in debug builds. In a
+/// release build the trust anchors come exclusively from the real project key(s)
+/// — baked in at official-build time via `CHERM_RELEASE_PUBS` and/or supplied at
+/// runtime via `CHERM_OFFICIAL_RELEASE_PUBS` — whose secrets are never shipped.
+/// A release client with no configured key trusts no release key (servers then
+/// show 🔴), which is the safe default.
+pub fn pinned() -> Official {
+    let mut release_pubkeys: Vec<(String, String)> = Vec::new();
+
+    // Real project key(s) baked in when the official client is built.
+    if let Some(baked) = option_env!("CHERM_RELEASE_PUBS") {
+        add_keys(baked, &mut release_pubkeys);
+    }
+    // Runtime override / additional production keys.
+    if let Ok(extra) = std::env::var("CHERM_OFFICIAL_RELEASE_PUBS") {
+        add_keys(&extra, &mut release_pubkeys);
+    }
+    // Dev key: debug builds ONLY (its secret is public in the repo).
+    if cfg!(debug_assertions) {
+        add_keys(DEV_RELEASE_PUBLIC_B64, &mut release_pubkeys);
+    }
+
+    let official_build_hash = std::env::var("CHERM_OFFICIAL_HASH")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let nitro_pcr0 = std::env::var("CHERM_OFFICIAL_PCR0")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let mut nitro_roots = Vec::new();
     if let Ok(der) = crate::pem_first_der(AWS_NITRO_ROOT_PEM) {

@@ -46,6 +46,22 @@ impl Attestor {
             Some(secret) => {
                 ReleaseKey::from_secret_b64(secret).context("parsing --release-secret")?
             }
+            // No release secret supplied. The committed dev key's SECRET is public
+            // (anyone could forge an "official" software signature with it), so a
+            // RELEASE build must NOT silently fall back to it — that ships a
+            // server believing it serves a 🟡 software tier while every release
+            // client correctly shows 🔴, a confusing and insecure misconfiguration.
+            // Fail closed: require an explicit `--release-secret` or an explicit
+            // `--no-attest` (which serves an honest unsigned 🔴). The dev key is
+            // only an acceptable default in debug builds (local demos), where
+            // clients also trust it via `cfg!(debug_assertions)`.
+            None if !no_attest && !cfg!(debug_assertions) => {
+                anyhow::bail!(
+                    "refusing to start a release server without a release key: pass \
+                     --release-secret <b64> to sign the software tier, or --no-attest \
+                     to serve an honest unsigned attestation"
+                );
+            }
             None => ReleaseKey::dev(),
         };
         Ok(Attestor {
@@ -76,7 +92,13 @@ impl Attestor {
         if self.no_attest {
             build_unsigned(nonce_b64, &self.version, now_ms, &self.instance)
         } else {
-            build_software(nonce_b64, &self.version, now_ms, &self.release, &self.instance)
+            build_software(
+                nonce_b64,
+                &self.version,
+                now_ms,
+                &self.release,
+                &self.instance,
+            )
         }
     }
 }

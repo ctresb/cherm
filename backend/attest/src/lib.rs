@@ -89,11 +89,20 @@ fn instance_msg(nonce_b64: &str, build_hash: &str, ts: i64) -> Vec<u8> {
 /// Hex BLAKE3 of the running executable — the server's build measurement.
 /// Honest: a malicious operator can patch the binary to report any value; this
 /// is a deterrent unless combined with a TEE quote.
+///
+/// The result is computed once and cached: the executable cannot change while the
+/// process runs, so re-reading + re-hashing it on every (pre-auth, unauthenticated)
+/// `AttestRequest` was pure attacker-controllable CPU/I/O — a cheap amplification
+/// vector. Caching makes each attestation a constant-cost signature instead.
 pub fn build_hash() -> String {
-    match std::env::current_exe().and_then(std::fs::read) {
-        Ok(bytes) => hex::encode(blake3::hash(&bytes).as_bytes()),
-        Err(_) => "unknown".to_string(),
-    }
+    use std::sync::OnceLock;
+    static BUILD_HASH: OnceLock<String> = OnceLock::new();
+    BUILD_HASH
+        .get_or_init(|| match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => hex::encode(blake3::hash(&bytes).as_bytes()),
+            Err(_) => "unknown".to_string(),
+        })
+        .clone()
 }
 
 /// The project release key (signs build hashes at release time). In dev the
@@ -123,7 +132,11 @@ impl ReleaseKey {
     }
 
     pub fn sign(&self, version: &str, build_hash: &str) -> String {
-        B64.encode(self.signing.sign(&release_msg(version, build_hash)).to_bytes())
+        B64.encode(
+            self.signing
+                .sign(&release_msg(version, build_hash))
+                .to_bytes(),
+        )
     }
 }
 
@@ -193,7 +206,12 @@ pub fn build_software(
 }
 
 /// Build an unsigned attestation (no integrity claim).
-pub fn build_unsigned(nonce_b64: &str, version: &str, now_ms: i64, instance: &InstanceKey) -> Attestation {
+pub fn build_unsigned(
+    nonce_b64: &str,
+    version: &str,
+    now_ms: i64,
+    instance: &InstanceKey,
+) -> Attestation {
     let bh = build_hash();
     Attestation {
         tier: Tier::Unsigned,
@@ -215,7 +233,12 @@ pub fn build_unsigned(nonce_b64: &str, version: &str, now_ms: i64, instance: &In
 // ===========================================================================
 
 /// Verify an attestation against the pinned official trust set.
-pub fn verify(att: &Attestation, expected_nonce_b64: &str, now_ms: i64, off: &Official) -> VerifyResult {
+pub fn verify(
+    att: &Attestation,
+    expected_nonce_b64: &str,
+    now_ms: i64,
+    off: &Official,
+) -> VerifyResult {
     let fp = fingerprint_of(&att.instance_pub);
     let red = |reason: &str| VerifyResult {
         verdict: Verdict::Red,
@@ -233,7 +256,13 @@ pub fn verify(att: &Attestation, expected_nonce_b64: &str, now_ms: i64, off: &Of
         Tier::Unsigned => red("server provided no signature — its code is unverified"),
 
         Tier::Software => {
-            if !verify_release_sig(off, &att.release_key_id, &att.release_version, &att.build_hash, &att.release_sig) {
+            if !verify_release_sig(
+                off,
+                &att.release_key_id,
+                &att.release_version,
+                &att.build_hash,
+                &att.release_sig,
+            ) {
                 return red("release signature is not from the official project key");
             }
             if let Some(expected) = &off.official_build_hash {
@@ -241,7 +270,13 @@ pub fn verify(att: &Attestation, expected_nonce_b64: &str, now_ms: i64, off: &Of
                     return red("build hash does not match the official public codebase");
                 }
             }
-            if !verify_instance_sig(&att.instance_pub, &att.nonce, &att.build_hash, att.server_unix_ms, &att.instance_sig) {
+            if !verify_instance_sig(
+                &att.instance_pub,
+                &att.nonce,
+                &att.build_hash,
+                att.server_unix_ms,
+                &att.instance_sig,
+            ) {
                 return red("server instance signature is invalid");
             }
             VerifyResult {
@@ -257,23 +292,39 @@ pub fn verify(att: &Attestation, expected_nonce_b64: &str, now_ms: i64, off: &Of
             let Some(q) = &att.tee_quote else {
                 return red("tee tier but no quote provided");
             };
-            let (Ok(quote), Ok(nonce_bytes)) = (b64_decode(q), b64_decode(expected_nonce_b64)) else {
+            // FAIL CLOSED: a 🟢 verdict means "the OFFICIAL CHERM enclave build".
+            // Without a pinned official PCR0 measurement, a valid Nitro quote only
+            // proves "some AWS enclave" — a malicious operator could run arbitrary
+            // code in any enclave, bind the nonce + instance key, and still pass
+            // root/COSE/nonce/user-data checks. So if no PCR0 is pinned we must NOT
+            // grant green; refuse rather than trust an unmeasured enclave.
+            let Some(expected_pcr0) = off.nitro_pcr0.as_deref() else {
+                return red(
+                    "TEE verification unavailable: no official Nitro PCR0 is pinned in this build",
+                );
+            };
+            let (Ok(quote), Ok(nonce_bytes)) = (b64_decode(q), b64_decode(expected_nonce_b64))
+            else {
                 return red("malformed tee quote or nonce");
             };
             let instance_raw = b64_decode(&att.instance_pub).unwrap_or_default();
             match nitro::verify(
                 &quote,
-                off.nitro_pcr0.as_deref(),
+                Some(expected_pcr0),
                 &nonce_bytes,
                 now_ms,
                 &off.nitro_roots,
                 Some(&instance_raw),
             ) {
-                Ok(_claims) => VerifyResult {
+                Ok(claims) => VerifyResult {
                     verdict: Verdict::Green,
                     tier: att.tier,
                     reason: "hardware TEE attests the official build".to_string(),
-                    build_hash: att.build_hash.clone(),
+                    // Surface the VERIFIED enclave measurement (PCR0), not the
+                    // self-reported `att.build_hash` wire field — which is NOT
+                    // authenticated in the TEE tier and could otherwise display an
+                    // attacker-chosen string next to the green verdict.
+                    build_hash: claims.pcr0_hex,
                     fingerprint: fp,
                 },
                 Err(e) => red(&format!("TEE quote verification failed: {e}")),
@@ -282,22 +333,41 @@ pub fn verify(att: &Attestation, expected_nonce_b64: &str, now_ms: i64, off: &Of
     }
 }
 
-fn verify_release_sig(off: &Official, key_id: &str, version: &str, build_hash: &str, sig_b64: &str) -> bool {
+fn verify_release_sig(
+    off: &Official,
+    key_id: &str,
+    version: &str,
+    build_hash: &str,
+    sig_b64: &str,
+) -> bool {
     let Some((_, pub_b64)) = off.release_pubkeys.iter().find(|(id, _)| id == key_id) else {
         return false;
     };
     verify_ed(pub_b64, &release_msg(version, build_hash), sig_b64)
 }
 
-fn verify_instance_sig(instance_pub_b64: &str, nonce_b64: &str, build_hash: &str, ts: i64, sig_b64: &str) -> bool {
-    verify_ed(instance_pub_b64, &instance_msg(nonce_b64, build_hash, ts), sig_b64)
+fn verify_instance_sig(
+    instance_pub_b64: &str,
+    nonce_b64: &str,
+    build_hash: &str,
+    ts: i64,
+    sig_b64: &str,
+) -> bool {
+    verify_ed(
+        instance_pub_b64,
+        &instance_msg(nonce_b64, build_hash, ts),
+        sig_b64,
+    )
 }
 
 fn verify_ed(pub_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
     let (Ok(pk_bytes), Ok(sig_bytes)) = (decode32(pub_b64), b64_decode(sig_b64)) else {
         return false;
     };
-    let (Ok(vk), Ok(sig)) = (VerifyingKey::from_bytes(&pk_bytes), Signature::from_slice(&sig_bytes)) else {
+    let (Ok(vk), Ok(sig)) = (
+        VerifyingKey::from_bytes(&pk_bytes),
+        Signature::from_slice(&sig_bytes),
+    ) else {
         return false;
     };
     vk.verify_strict(msg, &sig).is_ok()
@@ -388,6 +458,27 @@ mod tests {
     }
 
     #[test]
+    fn dev_key_rejected_when_not_trusted() {
+        // Simulate a release build's trust set: the committed dev key is NOT a
+        // trust anchor, so a dev-signed ("rP8Fiok...") attestation must be red.
+        let release = ReleaseKey::dev();
+        let instance = InstanceKey::generate();
+        let nonce = b64_encode(b"n");
+        let att = build_software(&nonce, "0.1.0", NOW, &release, &instance);
+        let off = Official {
+            release_pubkeys: Vec::new(), // production trust set without the dev key
+            official_build_hash: None,
+            nitro_pcr0: None,
+            nitro_roots: Vec::new(),
+        };
+        assert_eq!(
+            verify(&att, &nonce, NOW, &off).verdict,
+            Verdict::Red,
+            "an attestation signed by the public dev key must not be trusted in production"
+        );
+    }
+
+    #[test]
     fn wrong_release_key_yields_red() {
         let rogue = ReleaseKey::from_secret_b64(&b64_encode(&[7u8; 32])).unwrap();
         let instance = InstanceKey::generate();
@@ -403,7 +494,32 @@ mod tests {
         let instance = InstanceKey::generate();
         let att = build_software(&b64_encode(b"old-nonce"), "0.1.0", NOW, &release, &instance);
         let off = official::pinned();
-        assert_eq!(verify(&att, &b64_encode(b"new-nonce"), NOW, &off).verdict, Verdict::Red);
+        assert_eq!(
+            verify(&att, &b64_encode(b"new-nonce"), NOW, &off).verdict,
+            Verdict::Red
+        );
+    }
+
+    #[test]
+    fn tee_without_pinned_pcr0_is_red() {
+        // A 🟢 verdict must require a pinned official PCR0. With none configured,
+        // even a (here syntactically-bogus) TEE quote must be refused, NOT trusted:
+        // the fail-closed branch returns red before any enclave check runs, so a
+        // malicious operator running arbitrary code in *some* enclave can't get green.
+        let instance = InstanceKey::generate();
+        let nonce = b64_encode(b"0123456789abcdef0123456789abcdef");
+        let mut att = build_software(&nonce, "0.1.0", NOW, &ReleaseKey::dev(), &instance);
+        att.tier = Tier::Tee;
+        att.tee_quote = Some(b64_encode(&[1, 2, 3, 4]));
+        let off = official::pinned(); // no CHERM_OFFICIAL_PCR0 set in tests
+        assert!(off.nitro_pcr0.is_none(), "test precondition: no pinned PCR0");
+        let r = verify(&att, &nonce, NOW, &off);
+        assert_eq!(r.verdict, Verdict::Red, "{}", r.reason);
+        assert!(
+            r.reason.contains("no official Nitro PCR0"),
+            "must fail closed for the right reason: {}",
+            r.reason
+        );
     }
 
     #[test]

@@ -44,10 +44,27 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    // ~/.cherm
+    // ~/.cherm — created OWNER-ONLY (0700) so a co-tenant can't read/plant inside
+    // the dir that holds the master key, vaults, and identity backups.
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow!("could not determine home directory"))?
         .join(".cherm");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&home)?;
+        // If the dir pre-existed with looser perms, tighten it.
+        if let Ok(meta) = std::fs::metadata(&home) {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&home)?;
 
     // Master key (~/.cherm/master.key, 32 bytes, mode 0600).

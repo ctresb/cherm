@@ -14,3 +14,8 @@ rand.workspace = true
 vodozemac.workspace = true
 chacha20poly1305.workspace = true
 blake3.workspace = true
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+# For O_NOFOLLOW (value is platform-specific) when writing secret files safely.
+libc = "0.2"

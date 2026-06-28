@@ -51,11 +51,21 @@ pub async fn check_client_update(current_version: &str, events: &Events) -> Resu
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("cherm-core/", env!("CARGO_PKG_VERSION")))
+        // Bound connect + total time so a stalled/hostile endpoint can't wedge the
+        // (sequential) core command loop.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
     let meta: ReleaseMeta = match client.get(&url).send().await {
-        Ok(r) => r.json().await.unwrap_or_default(),
+        Ok(r) => {
+            // Cap the body: this manifest is tiny; refuse a multi-MB response.
+            match r.content_length() {
+                Some(len) if len > 256 * 1024 => ReleaseMeta::default(),
+                _ => r.json().await.unwrap_or_default(),
+            }
+        }
         Err(e) => {
             events.emit(json!({
                 "event": "error", "code": "update_check_failed",

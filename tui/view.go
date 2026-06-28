@@ -292,21 +292,29 @@ func (m Model) sidebarView() string {
 		if name == "" {
 			name = cs.info.ID
 		}
-		if cs.info.Kind == "group" {
-			name = "#" + name
+		// Distinct marker per kind: groups get a bold accent "#", DMs a muted "@".
+		isGroup := cs.info.Kind == "group"
+		glyph := "@"
+		glyphStyle := dmGlyphStyle
+		nameStyle := itemStyle
+		if isGroup {
+			glyph = "#"
+			glyphStyle = groupGlyphStyle
+			nameStyle = groupItemStyle
 		}
 
-		label := truncate(name, innerW-2)
+		label := truncate(name, clampMin(innerW-4, 1))
 		if i == m.sidebarSel {
-			// Selected row: a full-width magenta pill.
-			b.WriteString(selectedStyle.Width(innerW).Render(" "+label) + "\n")
+			// Selected row: a full-width pill (the pill colour already stands out,
+			// so keep the glyph inline for kind).
+			b.WriteString(selectedStyle.Width(innerW).Render(" "+glyph+" "+label) + "\n")
 			continue
 		}
-		dot := "  "
+		dot := " "
 		if cs.activity {
-			dot = activityStyle.Render("• ")
+			dot = activityStyle.Render("•")
 		}
-		b.WriteString(dot + itemStyle.Render(label) + "\n")
+		b.WriteString(dot + " " + glyphStyle.Render(glyph) + " " + nameStyle.Render(label) + "\n")
 	}
 
 	return boxStyle(m.focus == focusSidebar).
@@ -439,7 +447,17 @@ func (m Model) helpView() string {
 
 	b.WriteString(titleStyle.Render("commands") + "\n")
 	b.WriteString(helpRow("/dm <user>", "start or open a 1:1 chat"))
-	b.WriteString(helpRow("/group <name> <u...>", "create a group"))
+	b.WriteString(helpRow("/group <name> …", "create a group (mode=open|approval|invite_only)"))
+	b.WriteString(helpRow("/join <id> <key> <owner>", "request to join a group you were invited to"))
+	b.WriteString(helpRow("/key", "show this group's invite key (owner: + pending)"))
+	b.WriteString(helpRow("/access <mode>", "owner: set open|approval|invite_only"))
+	b.WriteString(helpRow("/invite <user>", "owner: add a user directly"))
+	b.WriteString(helpRow("/accept <user>", "owner: admit a pending join request"))
+	b.WriteString(helpRow("/remove <user>", "owner: remove a user from the group"))
+	b.WriteString(helpRow("/ban <user>", "owner: remove + block from rejoining"))
+	b.WriteString(helpRow("/unban <user>", "owner: lift a ban"))
+	b.WriteString(helpRow("/suspend <user> <dur>", "owner: time-out a user (30m, 2h, 1d)"))
+	b.WriteString(helpRow("/unsuspend <user>", "owner: lift a suspension early"))
 	b.WriteString(helpRow("/servers", "switch / add a server"))
 	b.WriteString(helpRow("/store", "browse & install plugins"))
 	b.WriteString(helpRow("/submit", "submit a plugin to the store"))

@@ -125,13 +125,7 @@ make run
 
 ## Architecture
 
-```text
-┌─────────────┐   stdio NDJSON   ┌──────────────┐   TCP frames   ┌──────────────┐
-│  tui (Go)   │ ───────────────▶ │ core (Rust)  │ ─────────────▶ │ relay server │
-│ Bubble Tea  │ ◀─────────────── │ vodozemac    │ ◀───────────── │ Rust/Tokio   │
-└─────────────┘   UI events      │ SQLCipher    │  ciphertext   └──────────────┘
- presentation only              └──────────────┘                 store-forward only
-```
+![cherm.chat architecture infographic](docs/infographic/cherm-architecture/cherm-architecture.png)
 
 | Layer | Owns | Does not own |
 |---|---|---|

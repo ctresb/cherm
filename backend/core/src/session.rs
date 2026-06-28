@@ -189,7 +189,25 @@ impl App {
             Command::ListChats => self.list_chats(),
             Command::History { chat, limit } => self.history(&chat, limit.unwrap_or(200)),
             Command::StartDm { username } => self.start_dm(username).await,
-            Command::CreateGroup { name, members } => self.create_group(name, members).await,
+            Command::CreateGroup {
+                name,
+                members,
+                access_mode,
+            } => self.create_group(name, members, access_mode).await,
+            Command::SetAccess { group, mode } => self.set_access(group, mode).await,
+            Command::JoinGroup { group, key, owner } => self.join_group(group, key, owner).await,
+            Command::InviteMember { group, username } => self.invite_member(group, username).await,
+            Command::AcceptMember { group, username } => self.accept_member(group, username).await,
+            Command::RemoveMember { group, username } => self.remove_member(group, username).await,
+            Command::BanMember { group, username } => self.ban_member(group, username).await,
+            Command::UnbanMember { group, username } => self.unban_member(group, username),
+            Command::UnsuspendMember { group, username } => self.unsuspend_member(group, username),
+            Command::SuspendMember {
+                group,
+                username,
+                duration,
+            } => self.suspend_member(group, username, duration).await,
+            Command::GroupInfo { group } => self.group_info(group),
             Command::Send { chat, text } => self.send(chat, text).await,
             Command::LeaveChat { chat } => self.leave_chat(chat).await,
             Command::Ping => self.ping().await,
@@ -287,8 +305,7 @@ impl App {
                 );
             }
             Err(e) => {
-                self.events
-                    .emit(err_event("check_failed", &e.to_string()));
+                self.events.emit(err_event("check_failed", &e.to_string()));
             }
         }
         self.save_index()?;
@@ -332,7 +349,8 @@ impl App {
         let (read_half, link) = match net::open(&server).await {
             Ok(p) => p,
             Err(e) => {
-                self.events.emit(err_event("connect_failed", &e.to_string()));
+                self.events
+                    .emit(err_event("connect_failed", &e.to_string()));
                 return Ok(());
             }
         };
@@ -364,7 +382,10 @@ impl App {
         .await?;
 
         match reply {
-            ServerMsg::AuthOk { uuid, username: uname } => {
+            ServerMsg::AuthOk {
+                uuid,
+                username: uname,
+            } => {
                 vault::meta_set(&vault, "username", &uname)?;
                 vault::meta_set(&vault, "uuid", &uuid)?;
                 vault::meta_set(&vault, "server", &server)?;
@@ -400,7 +421,8 @@ impl App {
                 }
                 self.active = Some(server.clone());
 
-                let _ = net::send_and_wait(&link, ClientMsg::PublishPrekeys { one_time_keys }).await;
+                let _ =
+                    net::send_and_wait(&link, ClientMsg::PublishPrekeys { one_time_keys }).await;
                 let _ = net::send(&link, ClientMsg::Pull);
 
                 self.index.set_username(&server, &uname);
@@ -412,8 +434,7 @@ impl App {
                 self.events.emit(
                     json!({"event": "connected", "server": server, "username": uname, "active": true}),
                 );
-                self.events
-                    .emit(vault::build_chats_event(&vault, &server)?);
+                self.events.emit(vault::build_chats_event(&vault, &server)?);
                 self.emit_servers();
             }
             ServerMsg::Error { code, message } => {
@@ -422,8 +443,10 @@ impl App {
             }
             other => {
                 handle.abort();
-                self.events
-                    .emit(err_event("internal", &format!("unexpected register reply: {other:?}")));
+                self.events.emit(err_event(
+                    "internal",
+                    &format!("unexpected register reply: {other:?}"),
+                ));
             }
         }
         Ok(())
@@ -447,8 +470,10 @@ impl App {
         let device = match vault::load_account(&vault, &vk)? {
             Some(d) => d,
             None => {
-                self.events
-                    .emit(err_event("internal", "username present but no device in vault"));
+                self.events.emit(err_event(
+                    "internal",
+                    "username present but no device in vault",
+                ));
                 return Ok(());
             }
         };
@@ -457,7 +482,8 @@ impl App {
         let (read_half, link) = match net::open(&server).await {
             Ok(p) => p,
             Err(e) => {
-                self.events.emit(err_event("connect_failed", &e.to_string()));
+                self.events
+                    .emit(err_event("connect_failed", &e.to_string()));
                 return Ok(());
             }
         };
@@ -475,7 +501,14 @@ impl App {
         let _ = net::send_and_wait(&link, client_hello()).await;
 
         // AuthBegin -> Challenge -> sign(b64decode(nonce)) -> AuthFinish -> AuthOk.
-        let nonce = match net::send_and_wait(&link, ClientMsg::AuthBegin { username: username.clone() }).await? {
+        let nonce = match net::send_and_wait(
+            &link,
+            ClientMsg::AuthBegin {
+                username: username.clone(),
+            },
+        )
+        .await?
+        {
             ServerMsg::Challenge { nonce } => nonce,
             ServerMsg::Error { code, message } => {
                 handle.abort();
@@ -484,8 +517,10 @@ impl App {
             }
             other => {
                 handle.abort();
-                self.events
-                    .emit(err_event("internal", &format!("unexpected challenge: {other:?}")));
+                self.events.emit(err_event(
+                    "internal",
+                    &format!("unexpected challenge: {other:?}"),
+                ));
                 return Ok(());
             }
         };
@@ -501,7 +536,10 @@ impl App {
         let signature = device.sign_b64(&nonce_bytes);
         let (uuid, uname) = match net::send_and_wait(
             &link,
-            ClientMsg::AuthFinish { username: username.clone(), signature },
+            ClientMsg::AuthFinish {
+                username: username.clone(),
+                signature,
+            },
         )
         .await?
         {
@@ -513,8 +551,10 @@ impl App {
             }
             other => {
                 handle.abort();
-                self.events
-                    .emit(err_event("internal", &format!("unexpected auth reply: {other:?}")));
+                self.events.emit(err_event(
+                    "internal",
+                    &format!("unexpected auth reply: {other:?}"),
+                ));
                 return Ok(());
             }
         };
@@ -635,14 +675,16 @@ impl App {
         let (server, vault, vk) = match self.active_vault() {
             Some(x) => x,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let username = match vault::meta_get(&vault, "username")? {
             Some(u) => u,
             None => {
-                self.events.emit(err_event("not_registered", "register first"));
+                self.events
+                    .emit(err_event("not_registered", "register first"));
                 return Ok(());
             }
         };
@@ -650,7 +692,8 @@ impl App {
         let device = match vault::load_account(&vault, &vk)? {
             Some(d) => d,
             None => {
-                self.events.emit(err_event("internal", "no identity in vault"));
+                self.events
+                    .emit(err_event("internal", "no identity in vault"));
                 return Ok(());
             }
         };
@@ -670,16 +713,20 @@ impl App {
         let data = match std::fs::read_to_string(&path) {
             Ok(d) => d,
             Err(e) => {
-                self.events
-                    .emit(err_event("import_failed", &format!("cannot read {path}: {e}")));
+                self.events.emit(err_event(
+                    "import_failed",
+                    &format!("cannot read {path}: {e}"),
+                ));
                 return Ok(());
             }
         };
         let v: Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
-                self.events
-                    .emit(err_event("import_failed", &format!("invalid identity file: {e}")));
+                self.events.emit(err_event(
+                    "import_failed",
+                    &format!("invalid identity file: {e}"),
+                ));
                 return Ok(());
             }
         };
@@ -694,8 +741,10 @@ impl App {
         let device = match Device::from_pickle_json(account) {
             Ok(d) => d,
             Err(e) => {
-                self.events
-                    .emit(err_event("import_failed", &format!("bad identity key: {e}")));
+                self.events.emit(err_event(
+                    "import_failed",
+                    &format!("bad identity key: {e}"),
+                ));
                 return Ok(());
             }
         };
@@ -730,14 +779,16 @@ impl App {
         let (server, vault, vk) = match self.active_vault() {
             Some(x) => x,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let me = match vault::meta_get(&vault, "username")? {
             Some(m) => m,
             None => {
-                self.events.emit(err_event("not_registered", "register first"));
+                self.events
+                    .emit(err_event("not_registered", "register first"));
                 return Ok(());
             }
         };
@@ -749,15 +800,21 @@ impl App {
         let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events.emit(err_event("not_connected", "not connected"));
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
 
         // Establish an outbound Olm session if we don't already have one.
         if vault::load_olm(&vault, &vk, &username)?.is_none() {
-            match net::send_and_wait(&link, ClientMsg::FetchPrekeys { username: username.clone() })
-                .await?
+            match net::send_and_wait(
+                &link,
+                ClientMsg::FetchPrekeys {
+                    username: username.clone(),
+                },
+            )
+            .await?
             {
                 ServerMsg::PrekeyBundle {
                     username: u,
@@ -777,19 +834,31 @@ impl App {
                             return Ok(());
                         }
                     };
+                    // TOFU: refuse a substituted identity key for a known peer.
+                    if !net::accept_identity(
+                        &vault,
+                        &self.events,
+                        &u,
+                        &uuid,
+                        &ed25519,
+                        &curve25519,
+                    )? {
+                        return Ok(());
+                    }
                     let device = vault::load_account(&vault, &vk)?
                         .ok_or_else(|| anyhow!("no device identity"))?;
                     let session = device.start_session(&curve25519, &otk)?;
                     vault::save_olm(&vault, &vk, &username, &session)?;
-                    vault::upsert_contact(&vault, &u, &uuid, &ed25519, &curve25519)?;
                 }
                 ServerMsg::Error { code, message } => {
                     self.events.emit(err_event(&code, &message));
                     return Ok(());
                 }
                 other => {
-                    self.events
-                        .emit(err_event("internal", &format!("unexpected prekey reply: {other:?}")));
+                    self.events.emit(err_event(
+                        "internal",
+                        &format!("unexpected prekey reply: {other:?}"),
+                    ));
                     return Ok(());
                 }
             }
@@ -813,27 +882,44 @@ impl App {
         Ok(())
     }
 
-    /// `create_group` -> mint a Megolm session, create the room, and share the
-    /// session key to each member over their pairwise Olm channel.
-    async fn create_group(&mut self, name: String, members: Vec<String>) -> Result<()> {
+    /// `create_group` -> mint a Megolm session + a unique group key, create the
+    /// room with the chosen access mode, and share the session key to each
+    /// pre-added member over their pairwise Olm channel.
+    async fn create_group(
+        &mut self,
+        name: String,
+        members: Vec<String>,
+        access_mode: Option<String>,
+    ) -> Result<()> {
         let (server, vault, vk) = match self.active_vault() {
             Some(x) => x,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let me = match vault::meta_get(&vault, "username")? {
             Some(m) => m,
             None => {
-                self.events.emit(err_event("not_registered", "register first"));
+                self.events
+                    .emit(err_event("not_registered", "register first"));
                 return Ok(());
             }
         };
+        let mode = access_mode.unwrap_or_else(|| cherm_proto::access_mode::OPEN.to_string());
+        if !cherm_proto::access_mode::valid(&mode) {
+            self.events.emit(err_event(
+                "bad_access_mode",
+                "access mode must be open, approval or invite_only",
+            ));
+            return Ok(());
+        }
         let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events.emit(err_event("not_connected", "not connected"));
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
@@ -853,21 +939,29 @@ impl App {
         for m in &roster {
             vault::add_member(&vault, &group_id, m)?;
         }
+        // Mint the unique group key + record ourselves as owner BEFORE distributing
+        // (the share reads this metadata so members mirror owner/mode/key).
+        let key = vault::create_group_meta(&vault, &group_id, &mode, &me)?;
 
         self.distribute_group_key(&vault, &vk, &link, &me, &group_id, &name, &roster, &sender)
             .await?;
 
         self.events.emit(vault::build_chats_event(&vault, &server)?);
+        self.events.emit(json!({
+            "event": "info",
+            "message": format!("group \"{name}\" created — invite key {key} (mode: {mode})")
+        }));
         // Auto-open the new group so the creator lands in it directly.
         self.events
             .emit(json!({"event": "open_chat", "chat": group_id}));
         Ok(())
     }
 
-    /// Share a Megolm outbound session key with every other member over their
-    /// pairwise Olm session. Megolm is per-sender, so each member that wants to
-    /// speak in a group mints its own [`GroupSender`] and distributes it here
-    /// (called by `create_group` and lazily by `send` for non-creators).
+    /// Share a Megolm outbound session key with `recipients` over their pairwise
+    /// Olm sessions. Megolm is per-sender, so each member that wants to speak in a
+    /// group mints its own [`GroupSender`] and distributes it here (called by
+    /// `create_group` and lazily by `send` for non-creators). Thin wrapper over
+    /// [`net::distribute_group_key`], which the processor also uses.
     #[allow(clippy::too_many_arguments)]
     async fn distribute_group_key(
         &self,
@@ -877,83 +971,21 @@ impl App {
         me: &str,
         group_id: &str,
         name: &str,
-        roster: &[String],
+        recipients: &[String],
         sender: &cherm_crypto::GroupSender,
     ) -> Result<()> {
-        let device = vault::load_account(vault, vk)?
-            .ok_or_else(|| anyhow!("no device identity"))?;
-        let sender_curve = device.curve25519_b64();
-        let session_key = sender.session_key_b64();
-        let now = now_millis();
-
-        for member in roster {
-            if member == me {
-                continue;
-            }
-            // Ensure an Olm session to this member.
-            let mut session = match vault::load_olm(vault, vk, member)? {
-                Some(s) => s,
-                None => match net::send_and_wait(
-                    link,
-                    ClientMsg::FetchPrekeys { username: member.clone() },
-                )
-                .await?
-                {
-                    ServerMsg::PrekeyBundle {
-                        username: u,
-                        uuid,
-                        ed25519,
-                        curve25519,
-                        one_time_key: Some(otk),
-                        ..
-                    } => {
-                        vault::upsert_contact(vault, &u, &uuid, &ed25519, &curve25519)?;
-                        device.start_session(&curve25519, &otk)?
-                    }
-                    ServerMsg::PrekeyBundle { .. } => {
-                        self.events.emit(err_event(
-                            cherm_proto::errcode::NO_PREKEYS,
-                            &format!("{member} has no one-time keys; skipped"),
-                        ));
-                        continue;
-                    }
-                    ServerMsg::Error { code, message } => {
-                        self.events.emit(err_event(&code, &message));
-                        continue;
-                    }
-                    other => {
-                        self.events.emit(err_event(
-                            "internal",
-                            &format!("unexpected prekey reply: {other:?}"),
-                        ));
-                        continue;
-                    }
-                },
-            };
-
-            let share = json!({
-                "group_id": group_id,
-                "name": name,
-                "session_key": session_key.clone(),
-                "sender_curve": sender_curve.clone(),
-                "members": roster,
-            });
-            let plaintext = serde_json::to_vec(&share)?;
-            let (t, body) = session.encrypt(&plaintext)?;
-            vault::save_olm(vault, vk, member, &session)?;
-
-            net::send(
-                link,
-                ClientMsg::Send {
-                    to: vec![member.clone()],
-                    msg_type: "olm_group_key".to_string(),
-                    payload: net::encode_olm(t, &body),
-                    group_id: Some(group_id.to_string()),
-                    client_ts: now,
-                },
-            )?;
-        }
-        Ok(())
+        net::distribute_group_key(
+            vault,
+            vk,
+            link,
+            &self.events,
+            me,
+            group_id,
+            name,
+            recipients,
+            sender,
+        )
+        .await
     }
 
     /// `send` -> encrypt for the chat, relay it, store our plaintext, and echo.
@@ -961,14 +993,16 @@ impl App {
         let (_server, vault, vk) = match self.active_vault() {
             Some(x) => x,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let me = match vault::meta_get(&vault, "username")? {
             Some(m) => m,
             None => {
-                self.events.emit(err_event("not_registered", "register first"));
+                self.events
+                    .emit(err_event("not_registered", "register first"));
                 return Ok(());
             }
         };
@@ -983,7 +1017,8 @@ impl App {
         let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events.emit(err_event("not_connected", "not connected"));
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
@@ -1022,8 +1057,10 @@ impl App {
                         let roster = vault::get_members(&vault, &chat)?;
                         let s = cherm_crypto::GroupSender::new();
                         vault::save_group_out(&vault, &vk, &chat, &s)?;
-                        self.distribute_group_key(&vault, &vk, &link, &me, &chat, &title, &roster, &s)
-                            .await?;
+                        self.distribute_group_key(
+                            &vault, &vk, &link, &me, &chat, &title, &roster, &s,
+                        )
+                        .await?;
                         s
                     }
                 };
@@ -1045,8 +1082,10 @@ impl App {
                 )?;
             }
             other => {
-                self.events
-                    .emit(err_event("bad_request", &format!("unknown chat kind {other}")));
+                self.events.emit(err_event(
+                    "bad_request",
+                    &format!("unknown chat kind {other}"),
+                ));
                 return Ok(());
             }
         }
@@ -1065,14 +1104,16 @@ impl App {
         let (server, vault, vk) = match self.active_vault() {
             Some(x) => x,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let me = match vault::meta_get(&vault, "username")? {
             Some(m) => m,
             None => {
-                self.events.emit(err_event("not_registered", "register first"));
+                self.events
+                    .emit(err_event("not_registered", "register first"));
                 return Ok(());
             }
         };
@@ -1117,8 +1158,10 @@ impl App {
                         None => {
                             let s = cherm_crypto::GroupSender::new();
                             vault::save_group_out(&vault, &vk, &chat, &s)?;
-                            self.distribute_group_key(&vault, &vk, link, &me, &chat, &title, &members, &s)
-                                .await?;
+                            self.distribute_group_key(
+                                &vault, &vk, link, &me, &chat, &title, &members, &s,
+                            )
+                            .await?;
                             s
                         }
                     };
@@ -1139,18 +1182,501 @@ impl App {
                 }
             }
             other => {
-                self.events
-                    .emit(err_event("bad_request", &format!("unknown chat kind {other}")));
+                self.events.emit(err_event(
+                    "bad_request",
+                    &format!("unknown chat kind {other}"),
+                ));
                 return Ok(());
             }
         }
 
         // Remove the chat and all its local state.
         vault::delete_chat(&vault, &chat)?;
-        let notified = if link.is_some() { "" } else { " (offline — peers not notified)" };
+        let notified = if link.is_some() {
+            ""
+        } else {
+            " (offline — peers not notified)"
+        };
         self.events.emit(vault::build_chats_event(&vault, &server)?);
         self.events
             .emit(json!({"event": "info", "message": format!("left {chat}{notified}")}));
+        Ok(())
+    }
+
+    // -- group access control ----------------------------------------------
+
+    /// Common preamble for owner-only group commands. Resolves the active
+    /// server's vault + our identity + live link + the group's metadata, and
+    /// verifies we are the recorded owner. Emits the right error and returns
+    /// `None` otherwise.
+    #[allow(clippy::type_complexity)]
+    fn group_owner_ctx(
+        &self,
+        group: &str,
+    ) -> Result<
+        Option<(
+            String,
+            Vault,
+            [u8; 32],
+            ServerLink,
+            String,
+            vault::GroupMeta,
+        )>,
+    > {
+        let (server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
+            None => {
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
+                return Ok(None);
+            }
+        };
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events
+                    .emit(err_event("not_registered", "register first"));
+                return Ok(None);
+            }
+        };
+        let link = match self.active_link() {
+            Some(l) => l,
+            None => {
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
+                return Ok(None);
+            }
+        };
+        let meta = match vault::get_group_meta(&vault, group)? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event(
+                    "no_such_group",
+                    "no such group (open the group first)",
+                ));
+                return Ok(None);
+            }
+        };
+        if meta.owner.is_empty() || meta.owner != me {
+            self.events
+                .emit(err_event("not_owner", "only the group owner can do that"));
+            return Ok(None);
+        }
+        Ok(Some((server, vault, vk, link, me, meta)))
+    }
+
+    /// Mint a fresh outbound Megolm key and re-share it to the CURRENT roster, so
+    /// a just-removed/banned/suspended user (no longer on the roster) can no
+    /// longer read our future messages. Best-effort per member.
+    async fn rekey_group(
+        &self,
+        vault: &Vault,
+        vk: &[u8; 32],
+        link: &ServerLink,
+        me: &str,
+        group: &str,
+    ) -> Result<()> {
+        let s = cherm_crypto::GroupSender::new();
+        vault::save_group_out(vault, vk, group, &s)?;
+        let roster = vault::get_members(vault, group)?;
+        let name = vault::get_chat(vault, group)?
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+        self.distribute_group_key(vault, vk, link, me, group, &name, &roster, &s)
+            .await
+    }
+
+    /// `set_access` -> owner changes a group's access mode and notifies members.
+    async fn set_access(&mut self, group: String, mode: String) -> Result<()> {
+        if !cherm_proto::access_mode::valid(&mode) {
+            self.events.emit(err_event(
+                "bad_access_mode",
+                "access mode must be open, approval or invite_only",
+            ));
+            return Ok(());
+        }
+        let (_server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        vault::set_access_mode(&vault, &group, &mode)?;
+        let name = vault::get_chat(&vault, &group)?
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+        net::broadcast_group_event(
+            &vault,
+            &vk,
+            &link,
+            &self.events,
+            &me,
+            &group,
+            &name,
+            &json!({"kind": "access", "mode": mode}),
+        )
+        .await?;
+        let now = now_millis();
+        if let Some(text) = net::group_event_text("access", "", &mode) {
+            net::emit_system(&self.events, &vault, &group, &text, now)?;
+        }
+        self.events
+            .emit(json!({"event": "info", "message": format!("access mode set to {mode}")}));
+        Ok(())
+    }
+
+    /// `join_group` -> request to join a group we have an invite for: open an Olm
+    /// session to the owner and send them a `group_join` with the invite key.
+    async fn join_group(&mut self, group: String, key: String, owner: String) -> Result<()> {
+        let (_server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
+            None => {
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
+                return Ok(());
+            }
+        };
+        let me = match vault::meta_get(&vault, "username")? {
+            Some(m) => m,
+            None => {
+                self.events
+                    .emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
+        if !cherm_crypto::valid_group_key(&key) {
+            self.events
+                .emit(err_event("bad_key", "invalid group key (8 letters/digits)"));
+            return Ok(());
+        }
+        if owner == me {
+            self.events
+                .emit(err_event("self_join", "you are the owner of that group"));
+            return Ok(());
+        }
+        let link = match self.active_link() {
+            Some(l) => l,
+            None => {
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
+                return Ok(());
+            }
+        };
+        net::send_olm_control(
+            &vault,
+            &vk,
+            &link,
+            &self.events,
+            &owner,
+            cherm_proto::msgtype::GROUP_JOIN,
+            &group,
+            &json!({"group_id": group, "group_key": key}),
+        )
+        .await?;
+        self.events.emit(json!({
+            "event": "info",
+            "message": format!("join request sent to {owner} — you'll be added if accepted")
+        }));
+        Ok(())
+    }
+
+    /// `invite_member` -> owner directly adds a user (required for invite-only).
+    async fn invite_member(&mut self, group: String, username: String) -> Result<()> {
+        let (server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if username == me {
+            self.events
+                .emit(err_event("bad_request", "you are already in the group"));
+            return Ok(());
+        }
+        if vault::is_banned(&vault, &group, &username)? {
+            self.events.emit(err_event(
+                "banned",
+                &format!("{username} is banned from this group"),
+            ));
+            return Ok(());
+        }
+        let now = now_millis();
+        if vault::is_suspended(&vault, &group, &username, now)? {
+            self.events.emit(err_event(
+                "suspended",
+                &format!("{username} is suspended; /unsuspend first to add them back early"),
+            ));
+            return Ok(());
+        }
+        net::admit_member(
+            &vault,
+            &vk,
+            &link,
+            &self.events,
+            &me,
+            &server,
+            &group,
+            &username,
+            now,
+        )
+        .await?;
+        self.events
+            .emit(json!({"event": "info", "message": format!("invited {username}")}));
+        Ok(())
+    }
+
+    /// `accept_member` -> owner accepts a pending join request (approval mode).
+    async fn accept_member(&mut self, group: String, username: String) -> Result<()> {
+        let (server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if !vault::has_join_request(&vault, &group, &username)? {
+            self.events.emit(err_event(
+                "no_request",
+                &format!("no pending join request from {username}"),
+            ));
+            return Ok(());
+        }
+        if vault::is_banned(&vault, &group, &username)? {
+            self.events.emit(err_event(
+                "banned",
+                &format!("{username} is banned from this group"),
+            ));
+            return Ok(());
+        }
+        let now = now_millis();
+        if vault::is_suspended(&vault, &group, &username, now)? {
+            self.events.emit(err_event(
+                "suspended",
+                &format!("{username} is suspended; /unsuspend first to admit them early"),
+            ));
+            return Ok(());
+        }
+        net::admit_member(
+            &vault,
+            &vk,
+            &link,
+            &self.events,
+            &me,
+            &server,
+            &group,
+            &username,
+            now,
+        )
+        .await?;
+        self.events
+            .emit(json!({"event": "info", "message": format!("accepted {username}")}));
+        Ok(())
+    }
+
+    /// `remove_member` -> owner removes a user (they may rejoin per access mode).
+    async fn remove_member(&mut self, group: String, username: String) -> Result<()> {
+        let (_server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if username == me {
+            self.events.emit(err_event(
+                "bad_request",
+                "you can't remove yourself; leave the group",
+            ));
+            return Ok(());
+        }
+        self.moderate(&vault, &vk, &link, &group, &me, &username, "removed", None)
+            .await
+    }
+
+    /// `ban_member` -> owner removes + permanently blocks a user from rejoining.
+    async fn ban_member(&mut self, group: String, username: String) -> Result<()> {
+        let (_server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if username == me {
+            self.events
+                .emit(err_event("bad_request", "you can't ban yourself"));
+            return Ok(());
+        }
+        vault::ban_user(&vault, &group, &username, now_millis())?;
+        self.moderate(&vault, &vk, &link, &group, &me, &username, "banned", None)
+            .await
+    }
+
+    /// `unban_member` -> owner lifts a ban (the user may rejoin per access mode).
+    fn unban_member(&mut self, group: String, username: String) -> Result<()> {
+        let (_server, vault, _vk, _link, _me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if !vault::is_banned(&vault, &group, &username)? {
+            self.events.emit(err_event(
+                "not_banned",
+                &format!("{username} is not banned"),
+            ));
+            return Ok(());
+        }
+        vault::unban_user(&vault, &group, &username)?;
+        self.events
+            .emit(json!({"event": "info", "message": format!("unbanned {username}")}));
+        Ok(())
+    }
+
+    /// `unsuspend_member` -> owner lifts a suspension early (the user may rejoin).
+    fn unsuspend_member(&mut self, group: String, username: String) -> Result<()> {
+        let (_server, vault, _vk, _link, _me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if vault::suspended_until(&vault, &group, &username)?.is_none() {
+            self.events.emit(err_event(
+                "not_suspended",
+                &format!("{username} is not suspended"),
+            ));
+            return Ok(());
+        }
+        vault::clear_suspension(&vault, &group, &username)?;
+        self.events
+            .emit(json!({"event": "info", "message": format!("unsuspended {username}")}));
+        Ok(())
+    }
+
+    /// `suspend_member` -> owner temporarily blocks a user for `duration`.
+    async fn suspend_member(
+        &mut self,
+        group: String,
+        username: String,
+        duration: String,
+    ) -> Result<()> {
+        let (_server, vault, vk, link, me, _meta) = match self.group_owner_ctx(&group)? {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        if username == me {
+            self.events
+                .emit(err_event("bad_request", "you can't suspend yourself"));
+            return Ok(());
+        }
+        let dur_ms = match parse_duration(&duration) {
+            Some(ms) if ms > 0 => ms,
+            _ => {
+                self.events.emit(err_event(
+                    "bad_duration",
+                    "duration must look like 30s, 10m, 2h or 1d",
+                ));
+                return Ok(());
+            }
+        };
+        let until = now_millis() + dur_ms;
+        vault::suspend_user(&vault, &group, &username, until)?;
+        self.moderate(
+            &vault,
+            &vk,
+            &link,
+            &group,
+            &me,
+            &username,
+            "suspended",
+            Some(until),
+        )
+        .await
+    }
+
+    /// Shared body for remove/ban/suspend. Order matters: (1) broadcast the event
+    /// while the target is STILL a member, using the current key, so the target
+    /// itself receives it (and tears down their local copy for remove/ban) and
+    /// every member updates state; (2) drop the target from our roster + forget
+    /// their inbound session; (3) rotate the group key so the target can't read
+    /// any FUTURE traffic. Doing (3) before (1) would hide the removal notice from
+    /// the target (its `who == me` handling would never fire) — we want them told.
+    #[allow(clippy::too_many_arguments)]
+    async fn moderate(
+        &self,
+        vault: &Vault,
+        vk: &[u8; 32],
+        link: &ServerLink,
+        group: &str,
+        me: &str,
+        username: &str,
+        kind: &str,
+        until: Option<i64>,
+    ) -> Result<()> {
+        let name = vault::get_chat(vault, group)?
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+        let mut event = json!({"kind": kind, "who": username});
+        if let Some(until) = until {
+            // Carry the deadline so members mirror the suspension (and reject the
+            // target's key shares) until it expires.
+            event["until"] = json!(until);
+        }
+        // 1. Notify everyone (incl. the target) with the current key.
+        net::broadcast_group_event(vault, vk, link, &self.events, me, group, &name, &event).await?;
+        // 2. Remove the target and forget their inbound session (the owner also
+        //    stops rendering their future messages).
+        vault::remove_member(vault, group, username)?;
+        vault::delete_group_in(vault, group, username)?;
+        // 3. Rotate the key + re-share to the remaining roster, so the target's
+        //    old key can no longer read anything sent from now on.
+        self.rekey_group(vault, vk, link, me, group).await?;
+        let now = now_millis();
+        if let Some(text) = net::group_event_text(kind, username, "") {
+            net::emit_system(&self.events, vault, group, &text, now)?;
+        }
+        self.events
+            .emit(json!({"event": "info", "message": format!("{username} {kind}")}));
+        Ok(())
+    }
+
+    /// `group_info` -> surface a group's invite key, mode, owner and (for the
+    /// owner) any pending join requests and bans.
+    fn group_info(&self, group: String) -> Result<()> {
+        let (_server, vault, _vk) = match self.active_vault() {
+            Some(x) => x,
+            None => {
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
+                return Ok(());
+            }
+        };
+        let me = vault::meta_get(&vault, "username")?.unwrap_or_default();
+        let meta = match vault::get_group_meta(&vault, &group)? {
+            Some(m) => m,
+            None => {
+                self.events.emit(err_event(
+                    "no_such_group",
+                    "no such group (open a group first)",
+                ));
+                return Ok(());
+            }
+        };
+        let am_owner = !meta.owner.is_empty() && meta.owner == me;
+        // Include the group id so the owner can hand out a complete invite link:
+        // `/join <group-id> <key> <owner>`.
+        let mut msg = format!(
+            "group: {}  ·  invite key: {}  ·  mode: {}  ·  owner: {}",
+            meta.group_id,
+            meta.group_key,
+            meta.access_mode,
+            if meta.owner.is_empty() {
+                "(unknown)"
+            } else {
+                &meta.owner
+            }
+        );
+        if am_owner {
+            msg.push_str(&format!(
+                "  ·  share: /join {} {} {}",
+                meta.group_id, meta.group_key, me
+            ));
+        }
+        if am_owner {
+            let pending = vault::list_join_requests(&vault, &group)?;
+            if !pending.is_empty() {
+                msg.push_str(&format!("  ·  pending: {}", pending.join(", ")));
+            }
+            let bans = vault::list_bans(&vault, &group)?;
+            if !bans.is_empty() {
+                msg.push_str(&format!("  ·  banned: {}", bans.join(", ")));
+            }
+        }
+        self.events.emit(json!({"event": "info", "message": msg}));
         Ok(())
     }
 
@@ -1159,14 +1685,16 @@ impl App {
         let server = match self.active.clone() {
             Some(s) => s,
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 return Ok(());
             }
         };
         let link = match self.active_link() {
             Some(l) => l,
             None => {
-                self.events.emit(err_event("not_connected", "not connected"));
+                self.events
+                    .emit(err_event("not_connected", "not connected"));
                 return Ok(());
             }
         };
@@ -1179,8 +1707,10 @@ impl App {
                     .emit(json!({"event": "pong", "rtt_ms": rtt, "server": server}));
             }
             other => {
-                self.events
-                    .emit(err_event("internal", &format!("unexpected ping reply: {other:?}")));
+                self.events.emit(err_event(
+                    "internal",
+                    &format!("unexpected ping reply: {other:?}"),
+                ));
             }
         }
         Ok(())
@@ -1192,7 +1722,9 @@ impl App {
             Some((server, vault, _)) => {
                 self.events.emit(vault::build_chats_event(&vault, &server)?);
             }
-            None => self.events.emit(err_event("not_connected", "no active server")),
+            None => self
+                .events
+                .emit(err_event("not_connected", "no active server")),
         }
         Ok(())
     }
@@ -1202,7 +1734,8 @@ impl App {
         match self.active_vault() {
             Some((_server, vault, _)) => self.emit_history(&vault, chat, limit),
             None => {
-                self.events.emit(err_event("not_connected", "no active server"));
+                self.events
+                    .emit(err_event("not_connected", "no active server"));
                 Ok(())
             }
         }
@@ -1384,21 +1917,71 @@ pub fn normalize_addr(s: &str) -> String {
     }
 }
 
+/// Parse a human duration (`30s`, `10m`, `2h`, `1d`) into milliseconds. A bare
+/// number with no suffix is interpreted as minutes. Returns `None` on garbage or
+/// a negative value. Used by `/suspend <user> <duration>`.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let last = s.chars().last()?;
+    let (num_str, unit_ms): (&str, i64) = match last {
+        's' | 'S' => (&s[..s.len() - 1], 1_000),
+        'm' | 'M' => (&s[..s.len() - 1], 60_000),
+        'h' | 'H' => (&s[..s.len() - 1], 3_600_000),
+        'd' | 'D' => (&s[..s.len() - 1], 86_400_000),
+        c if c.is_ascii_digit() => (s, 60_000), // bare number => minutes
+        _ => return None,
+    };
+    let n: i64 = num_str.trim().parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    n.checked_mul(unit_ms)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_addr;
+    use super::{normalize_addr, parse_duration};
+
+    #[test]
+    fn durations_parse() {
+        assert_eq!(parse_duration("30s"), Some(30_000));
+        assert_eq!(parse_duration("10m"), Some(600_000));
+        assert_eq!(parse_duration("2h"), Some(7_200_000));
+        assert_eq!(parse_duration("1d"), Some(86_400_000));
+        assert_eq!(parse_duration("5"), Some(300_000)); // bare => minutes
+        assert_eq!(parse_duration("1H"), Some(3_600_000)); // case-insensitive
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("abc"), None);
+        assert_eq!(parse_duration("m"), None); // no number
+        assert_eq!(parse_duration("-3m"), None); // negative
+    }
 
     #[test]
     fn normalizes_user_input() {
         assert_eq!(normalize_addr("srv.cherm.chat"), "srv.cherm.chat:9000");
-        assert_eq!(normalize_addr("https://srv.cherm.chat"), "srv.cherm.chat:9000");
-        assert_eq!(normalize_addr("http://srv.cherm.chat/"), "srv.cherm.chat:9000");
-        assert_eq!(normalize_addr("https://srv.cherm.chat:9000"), "srv.cherm.chat:9000");
+        assert_eq!(
+            normalize_addr("https://srv.cherm.chat"),
+            "srv.cherm.chat:9000"
+        );
+        assert_eq!(
+            normalize_addr("http://srv.cherm.chat/"),
+            "srv.cherm.chat:9000"
+        );
+        assert_eq!(
+            normalize_addr("https://srv.cherm.chat:9000"),
+            "srv.cherm.chat:9000"
+        );
         assert_eq!(normalize_addr("srv.cherm.chat:9000"), "srv.cherm.chat:9000");
         assert_eq!(normalize_addr(" 127.0.0.1:4000 "), "127.0.0.1:4000");
-        assert_eq!(normalize_addr("srv.cherm.chat:9000/path?x"), "srv.cherm.chat:9000");
+        assert_eq!(
+            normalize_addr("srv.cherm.chat:9000/path?x"),
+            "srv.cherm.chat:9000"
+        );
         // idempotent
-        assert_eq!(normalize_addr(&normalize_addr("https://srv.cherm.chat")), "srv.cherm.chat:9000");
+        assert_eq!(
+            normalize_addr(&normalize_addr("https://srv.cherm.chat")),
+            "srv.cherm.chat:9000"
+        );
     }
 }
 

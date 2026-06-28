@@ -47,8 +47,45 @@ pub enum Command {
     },
     /// `{"cmd":"start_dm","username":"bob"}`
     StartDm { username: String },
-    /// `{"cmd":"create_group","name":"devs","members":["bob","carol"]}`
-    CreateGroup { name: String, members: Vec<String> },
+    /// `{"cmd":"create_group","name":"devs","members":["bob"],"access_mode":"approval"}`
+    /// — `access_mode` is optional and defaults to `open`.
+    CreateGroup {
+        name: String,
+        members: Vec<String>,
+        #[serde(default)]
+        access_mode: Option<String>,
+    },
+    /// `{"cmd":"set_access","group":"<id>","mode":"approval"}` — owner only.
+    SetAccess { group: String, mode: String },
+    /// `{"cmd":"join_group","group":"<id>","key":"Ab3xZ9q0","owner":"alice"}` —
+    /// request to join a group you hold an invite for.
+    JoinGroup {
+        group: String,
+        key: String,
+        owner: String,
+    },
+    /// `{"cmd":"invite_member","group":"<id>","username":"bob"}` — owner only.
+    InviteMember { group: String, username: String },
+    /// `{"cmd":"accept_member","group":"<id>","username":"bob"}` — owner only
+    /// (approval mode).
+    AcceptMember { group: String, username: String },
+    /// `{"cmd":"remove_member","group":"<id>","username":"bob"}` — owner only.
+    RemoveMember { group: String, username: String },
+    /// `{"cmd":"ban_member","group":"<id>","username":"bob"}` — owner only.
+    BanMember { group: String, username: String },
+    /// `{"cmd":"unban_member","group":"<id>","username":"bob"}` — owner only.
+    UnbanMember { group: String, username: String },
+    /// `{"cmd":"unsuspend_member","group":"<id>","username":"bob"}` — owner only.
+    UnsuspendMember { group: String, username: String },
+    /// `{"cmd":"suspend_member","group":"<id>","username":"bob","duration":"10m"}`
+    /// — owner only.
+    SuspendMember {
+        group: String,
+        username: String,
+        duration: String,
+    },
+    /// `{"cmd":"group_info","group":"<id>"}` — show the invite key, mode, owner.
+    GroupInfo { group: String },
     /// `{"cmd":"send","chat":"bob","text":"hi"}`
     Send { chat: String, text: String },
     /// `{"cmd":"leave_chat","chat":"bob"}` — leave a DM or group (after confirm).
