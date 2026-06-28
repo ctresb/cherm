@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 
 $Base       = if ($env:CHERM_BASE_URL) { $env:CHERM_BASE_URL } else { "https://cherm.chat" }
 $InstallDir = if ($env:CHERM_INSTALL_DIR) { $env:CHERM_INSTALL_DIR } else { "$env:LOCALAPPDATA\Cherm\bin" }
-$Repo       = "https://github.com/cherm-chat/cherm"
+$Repo       = "https://github.com/ctresb/cherm"
 
 function Info($m) { Write-Host "==> $m" -ForegroundColor Magenta }
 function Die($m)  { Write-Host "error: $m" -ForegroundColor Red; exit 1 }

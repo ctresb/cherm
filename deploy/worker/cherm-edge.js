@@ -54,6 +54,11 @@ async function serveR2(bucket, key, defaultType) {
   if (!headers.has("content-type")) headers.set("content-type", defaultType || "application/octet-stream");
   headers.set("access-control-allow-origin", "*");
   if (key.startsWith("releases/")) headers.set("cache-control", "public, max-age=300");
+  // Content-hashed landing assets (Vite emits /assets/*-<hash>.js|css) + fonts +
+  // images never change for a given URL, so cache them hard. index.html stays
+  // fresh so a new deploy is picked up immediately.
+  else if (key.startsWith("assets/") || key.startsWith("fonts/") || /\.(woff2?|ttf|otf|png|jpe?g|webp|svg|ico)$/.test(key))
+    headers.set("cache-control", "public, max-age=31536000, immutable");
   else headers.set("cache-control", "no-store");
   return new Response(obj.body, { headers });
 }
@@ -183,26 +188,11 @@ async function handleDist(request, env, url) {
   if (path === "version.json") return serveR2(env.DIST, "version.json", "application/json");
   if (path.startsWith("releases/")) return serveR2(env.DIST, path, "application/octet-stream");
   if (path === "signatures") return new Response(SIGNATURES_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
-  if (path === "" || path === "docs" || path === "index.html") {
-    return new Response(LANDING_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
-  }
-  return json({ error: "not_found" }, 404);
+  // Landing site (web/dist) is uploaded to R2. Root serves index.html; every
+  // other path is looked up as a static asset (assets/*, fonts/*, images, …).
+  const key = (path === "" || path === "docs") ? "index.html" : path;
+  return serveR2(env.DIST, key, "application/octet-stream");
 }
-
-const LANDING_HTML = `<!doctype html><meta charset=utf-8><title>cherm.chat</title>
-<style>body{background:#17191d;color:#fff;font:16px/1.6 ui-monospace,monospace;max-width:46rem;margin:6vh auto;padding:0 1.2rem}
-a{color:#ee00ff}code{background:#241f2b;padding:.15em .4em;border-radius:4px}h1{color:#ff007b}pre{background:#241f2b;padding:1rem;border-radius:8px;overflow:auto}</style>
-<h1>✦ cherm.chat</h1>
-<p>Open, auditable, terminal-native encrypted chat.</p>
-<h3>Install the client (macOS / Linux)</h3>
-<pre>curl -fsSL https://cherm.chat/install.sh | bash</pre>
-<h3>Install a server</h3>
-<pre>curl -fsSL https://cherm.chat/server-install.sh | bash</pre>
-<h3>Audit-friendly path</h3>
-<pre>curl -fsSL https://cherm.chat/install.sh -o install.sh
-cat install.sh
-bash install.sh</pre>
-<p>Official server: <code>srv.cherm.chat:9000</code> · Plugin store: <a href="https://plugins.cherm.chat/index">plugins.cherm.chat</a> · <a href="/signatures">attestation tiers</a> · <a href="https://github.com/cherm-chat/cherm">source</a></p>`;
 
 const SIGNATURES_HTML = `<!doctype html><meta charset=utf-8><title>Cherm attestation tiers</title>
 <style>body{background:#17191d;color:#fff;font:16px/1.6 ui-monospace,monospace;max-width:46rem;margin:6vh auto;padding:0 1.2rem}h1{color:#ff007b}.g{color:#2ecc71}.y{color:#f1c40f}.r{color:#e74c3c}</style>
@@ -211,7 +201,7 @@ const SIGNATURES_HTML = `<!doctype html><meta charset=utf-8><title>Cherm attesta
 <p><span class=g>🟢 green</span> — a hardware TEE (AWS Nitro) proves the running code matches the official build.</p>
 <p><span class=y>🟡 yellow</span> — a genuine official release hash signed by the project key. Does not prove the server actually runs it (replayable). The official <code>srv.cherm.chat</code> on a normal VPS is yellow.</p>
 <p><span class=r>🔴 red</span> — unsigned, or the hash does not match the official public codebase.</p>
-<p>Pure software can't prove its own integrity; only a TEE makes it unforgeable. See <a href="https://github.com/cherm-chat/cherm/blob/main/ATTESTATION.md">ATTESTATION.md</a>.</p>`;
+<p>Pure software can't prove its own integrity; only a TEE makes it unforgeable. See <a href="https://github.com/ctresb/cherm/blob/main/ATTESTATION.md">ATTESTATION.md</a>.</p>`;
 
 // ---- router ----------------------------------------------------------------
 

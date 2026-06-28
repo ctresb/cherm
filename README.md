@@ -245,7 +245,7 @@ Example config:
 ```json
 {
   "name": "Cherm Main",
-  "repo_url": "https://github.com/cherm-chat/cherm",
+  "repo_url": "https://github.com/ctresb/cherm",
   "description": "official relay",
   "contact": "ops@cherm.chat",
   "reject_unofficial_clients": false,

@@ -41,7 +41,7 @@ manifest() { # version package_file permissions_json
   "description": "A soft pastel color theme for the Cherm TUI, maintained by Cherm.",
   "author": "Cherm",
   "license": "AGPL-3.0",
-  "source_url": "https://github.com/cherm-chat/cherm/tree/main/deploy/plugins/pastel-theme",
+  "source_url": "https://github.com/ctresb/cherm/tree/main/deploy/plugins/pastel-theme",
   "permissions": ${perms},
   "min_client": "0.1.0",
   "package_sha256": "$(sha256 "$pkg")",

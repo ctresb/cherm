@@ -42,7 +42,7 @@ anything else (unsigned, bad signature, hash/measurement mismatch)  -> RED    "d
   link → `/signatures`; buttons `Cancel` · `Connect`.
 - **RED**: text "this server does not match the official public codebase — it
   might be dangerous", with **public codebase** highlighted/clickable →
-  `https://github.com/cherm-chat/cherm`; buttons `Cancel` · `Connect anyway`,
+  `https://github.com/ctresb/cherm`; buttons `Cancel` · `Connect anyway`,
   where **Connect anyway** is disabled for a **10-second countdown**.
 
 ## Wire protocol (pre-auth, before registering a username)

@@ -8,7 +8,7 @@
 use crate::{b64_decode, b64_encode};
 
 /// Public links surfaced in the verdict UI.
-pub const PUBLIC_CODEBASE_URL: &str = "https://github.com/cherm-chat/cherm";
+pub const PUBLIC_CODEBASE_URL: &str = "https://github.com/ctresb/cherm";
 pub const SIGNATURES_URL: &str = "https://cherm.chat/signatures";
 
 /// DEV-ONLY release keypair. Its SECRET is committed in this repo, so it must

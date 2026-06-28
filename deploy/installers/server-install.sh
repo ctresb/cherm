@@ -18,7 +18,7 @@
 set -euo pipefail
 
 BASE="${CHERM_BASE_URL:-https://cherm.chat}"
-REPO="https://github.com/cherm-chat/cherm"
+REPO="https://github.com/ctresb/cherm"
 c_bold=$'\033[1m'; c_mag=$'\033[35m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
 info() { printf '%s==>%s %s\n' "$c_mag" "$c_off" "$*"; }
 err()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; }

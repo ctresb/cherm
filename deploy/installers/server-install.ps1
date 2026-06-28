@@ -12,7 +12,7 @@ $Base       = if ($env:CHERM_BASE_URL) { $env:CHERM_BASE_URL } else { "https://c
 $ServerHome = if ($env:CHERM_SERVER_HOME) { $env:CHERM_SERVER_HOME } else { "$env:LOCALAPPDATA\Cherm-Server" }
 $Listen     = if ($env:CHERM_SERVER_ADDR) { $env:CHERM_SERVER_ADDR } else { "0.0.0.0:9000" }
 $Public     = if ($env:CHERM_PUBLIC_ADDR) { $env:CHERM_PUBLIC_ADDR } else { "$env:COMPUTERNAME:9000" }
-$Repo       = "https://github.com/cherm-chat/cherm"
+$Repo       = "https://github.com/ctresb/cherm"
 
 function Info($m) { Write-Host "==> $m" -ForegroundColor Magenta }
 function Die($m)  { Write-Host "error: $m" -ForegroundColor Red; exit 1 }

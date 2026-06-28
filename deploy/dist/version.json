@@ -1,8 +1,8 @@
 {
   "client": {
-    "version": "0.1.1",
+    "version": "0.1.2",
     "channel": "stable",
-    "notes_url": "https://github.com/cherm-chat/cherm/releases",
+    "notes_url": "https://github.com/ctresb/cherm/releases",
     "url": "https://cherm.chat/install.sh"
   },
   "server": {

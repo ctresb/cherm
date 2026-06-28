@@ -16,7 +16,7 @@ set -euo pipefail
 
 BASE="${CHERM_BASE_URL:-https://cherm.chat}"
 PRODUCT="Cherm Client"
-REPO="https://github.com/cherm-chat/cherm"
+REPO="https://github.com/ctresb/cherm"
 
 # Default install dir: on Termux (Android) prefer $PREFIX/bin (writable + already
 # on PATH); elsewhere a user-local bin dir (no root needed).

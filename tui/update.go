@@ -31,7 +31,7 @@ import (
 // is the project DEV release key, whose secret is public in the repo — it proves
 // the update mechanism but is not a real production trust root. A real release
 // embeds a public key whose secret is held only by the project.
-const releasePublicKeyB64 = "rP8FiokGtvgz/SsImR73QCYo8fL5tAbw333dA5tUNJ8="
+const releasePublicKeyB64 = "GKfrjMEz4FWPDttzpNDmThSZotHZ9Cz7Io2TJwOY6LI="
 
 // verifyReleaseSig checks a detached base64 Ed25519 signature over data against
 // the embedded release public key.

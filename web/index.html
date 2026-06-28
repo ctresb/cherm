@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0c0f" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="canonical" href="https://cherm.chat/" />
+
+    <title>Cherm: private, end-to-end encrypted terminal chat</title>
+    <meta
+      name="description"
+      content="Cherm is a private chat that runs in your terminal. End-to-end encrypted with Olm and Megolm, local SQLCipher vaults, verifiable relay builds, and no passwords."
+    />
+    <meta
+      name="keywords"
+      content="encrypted chat, terminal chat, end-to-end encryption, E2EE, private messaging, Olm, Megolm, SQLCipher, self-hosted chat, secure messaging"
+    />
+    <meta name="robots" content="index, follow" />
+    <meta name="author" content="Cherm" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Cherm" />
+    <meta property="og:url" content="https://cherm.chat/" />
+    <meta property="og:title" content="Cherm: private, end-to-end encrypted terminal chat" />
+    <meta
+      property="og:description"
+      content="A private chat that runs in your terminal. The client owns the keys and crypto; the relay only moves ciphertext it cannot read."
+    />
+    <meta property="og:image" content="https://cherm.chat/og.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Cherm: encrypted before it ever leaves your terminal." />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Cherm: private, end-to-end encrypted terminal chat" />
+    <meta
+      name="twitter:description"
+      content="A private chat that runs in your terminal. The relay only moves ciphertext it cannot read."
+    />
+    <meta name="twitter:image" content="https://cherm.chat/og.jpg" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Cherm",
+        "applicationCategory": "CommunicationApplication",
+        "operatingSystem": "macOS, Linux, Windows",
+        "url": "https://cherm.chat/",
+        "description": "Cherm is a private, end-to-end encrypted chat that runs in your terminal. The client owns identity, sessions, and message crypto; the relay only moves ciphertext.",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

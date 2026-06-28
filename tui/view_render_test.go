@@ -34,7 +34,7 @@ func TestSnapshot(t *testing.T) {
 	verdicts := map[string]attestMsg{
 		"verdict_green":  {server: "chat.cherm.example:9000", verdict: "green", tier: "tee", buildHash: "abc123def456", fingerprint: "AA BB CC DD"},
 		"verdict_yellow": {server: "relay.example:9000", verdict: "yellow", tier: "software", buildHash: "abc123def456", signaturesURL: "https://cherm.chat/signatures"},
-		"verdict_red":    {server: "sketchy.example:9000", verdict: "red", tier: "unsigned", reason: "server provided no signature", publicCodebaseURL: "https://github.com/cherm-chat/cherm"},
+		"verdict_red":    {server: "sketchy.example:9000", verdict: "red", tier: "unsigned", reason: "server provided no signature", publicCodebaseURL: "https://github.com/ctresb/cherm"},
 	}
 	for name, v := range verdicts {
 		vm := renderModel(screenVerdict)
@@ -148,7 +148,7 @@ func TestRenderServerScreens(t *testing.T) {
 	// red verdict: dangerous wording, "public codebase" highlight, disabled
 	// "Connect anyway" with a live countdown.
 	r := renderModel(screenVerdict)
-	r.verdict = attestMsg{server: "evil:9000", verdict: "red", tier: "unsigned", buildHash: "deadbeef", publicCodebaseURL: "https://github.com/cherm-chat/cherm"}
+	r.verdict = attestMsg{server: "evil:9000", verdict: "red", tier: "unsigned", buildHash: "deadbeef", publicCodebaseURL: "https://github.com/ctresb/cherm"}
 	r.verdictCountdown = 7
 	r.verdictSel = 0
 	red := strip(r.View())
