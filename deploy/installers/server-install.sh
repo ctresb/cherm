@@ -114,7 +114,8 @@ exec "\$H/bin/cherm-server" \\
   --db "\$H/data/cherm-server.db" \\
   --instance-key "\$H/data/instance.key" \\
   --config "\$H/config/server.json" \\
-  --version "${version}"
+  --version "${version}" \\
+  --no-attest
 EOF
 
   cat > "$SERVER_HOME/status.sh" <<EOF
@@ -160,6 +161,12 @@ if [ -n "\$pid" ]; then
 fi
 cp -p "\$H/bin/cherm-server" "\$H/backups/cherm-server.\$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
 install -m 0755 "\$tmp/new" "\$H/bin/cherm-server"
+# A hardened server refuses to start in release mode without a release key OR
+# --no-attest. Older run-server.sh files predate that flag, so self-heal them
+# (add --no-attest after --version) to keep the update from bricking the server.
+if [ -f "\$H/run-server.sh" ] && ! grep -q -- '--no-attest\|--release-secret' "\$H/run-server.sh"; then
+  sed -i -E 's/(--version "[^"]*")/\1 --no-attest/' "\$H/run-server.sh" 2>/dev/null || true
+fi
 echo "==> binary replaced; restarting"
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^cherm-server'; then
   systemctl restart cherm-server || sudo systemctl restart cherm-server
