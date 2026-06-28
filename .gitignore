@@ -1,0 +1,19 @@
+# Rust
+/backend/target/
+**/*.rs.bk
+
+# Go
+/tui/cherm
+/tui/tui
+
+# Local runtime data
+*.db
+*.db-journal
+*.db-wal
+/cherm-server.db
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
