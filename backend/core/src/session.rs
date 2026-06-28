@@ -27,7 +27,7 @@ use crate::{attest_client, now_millis, update};
 const PREKEY_BATCH: usize = 20;
 
 /// Advertised client version (sent in `ClientHello` for the official-client policy).
-const CLIENT_VERSION: &str = "0.1.0+dev";
+const CLIENT_VERSION: &str = "0.1.1";
 
 // ===========================================================================
 // Persisted server index (~/.cherm/servers.json)

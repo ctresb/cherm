@@ -143,8 +143,9 @@ type Model struct {
 	docsURL string
 
 	// client identity / update state
-	clientVersion string
-	clientUpdate  *clientUpdateMsg // non-nil while a newer client is available
+	clientVersion   string
+	clientUpdate    *clientUpdateMsg // non-nil while a newer client is available
+	updateRequested bool             // user typed /update -> install directly if newer
 
 	// plugin store
 	storePlugins  []StorePlugin
@@ -399,6 +400,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clientUpdateMsg:
 		cu := msg
 		m.clientUpdate = &cu
+		// If the user explicitly ran /update, install it now; otherwise just show
+		// the opt-in banner (from a launch-time auto-check).
+		if m.updateRequested {
+			m.updateRequested = false
+			m.flash(fmt.Sprintf("update found (v%s) — downloading & verifying…", msg.latest), false)
+			return m, m.selfUpdateCmd()
+		}
 		m.flash(fmt.Sprintf("a new Cherm client is available: v%s (you have v%s)", msg.latest, msg.current), false)
 		return m, nil
 	case selfUpdateMsg:
@@ -952,6 +960,9 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 		return m.openSubmit()
 
 	case "/update":
+		// Explicit /update: check, and if a newer version exists, install it
+		// directly (the launch-time banner stays the passive, opt-in path).
+		m.updateRequested = true
 		m.flash("checking for a newer Cherm client…", false)
 		return m, m.cmdSend(map[string]any{"cmd": "check_client_update"})
 

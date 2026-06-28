@@ -57,7 +57,7 @@ func verifyReleaseSig(data []byte, sigB64 string) error {
 
 // clientVersion is this client's release version (matches version.json's
 // client.version when up to date).
-const clientVersion = "0.1.0"
+const clientVersion = "0.1.1"
 
 // updateBaseURL is the release origin; override with CHERM_BASE_URL for testing.
 func updateBaseURL() string {
