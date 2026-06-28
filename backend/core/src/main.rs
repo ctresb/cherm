@@ -17,11 +17,12 @@
 mod attest_client;
 mod ipc;
 mod net;
+mod plugins;
 mod session;
+mod update;
 mod vault;
 
 use anyhow::{anyhow, Result};
-use std::os::unix::fs::PermissionsExt;
 use tracing_subscriber::EnvFilter;
 
 /// Current unix time in milliseconds (the protocol's timestamp unit).
@@ -54,7 +55,7 @@ async fn main() -> Result<()> {
 
     // Server index (~/.cherm/servers.json).
     let index_path = home.join("servers.json");
-    let index: session::ServerIndex = if index_path.exists() {
+    let mut index: session::ServerIndex = if index_path.exists() {
         match std::fs::read_to_string(&index_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -65,6 +66,18 @@ async fn main() -> Result<()> {
     } else {
         session::ServerIndex::default()
     };
+    // Migrate legacy/bad cached addresses (e.g. a "srv.cherm.chat" without a port,
+    // or a pasted "https://…") to a connectable host:port, de-duplicating.
+    {
+        let mut seen = std::collections::HashSet::new();
+        index.servers.retain_mut(|r| {
+            r.addr = session::normalize_addr(&r.addr);
+            seen.insert(r.addr.clone())
+        });
+    }
+    // The official Cherm server is always present in the list, named "cherm.chat"
+    // so users connect without thinking about host:port.
+    index.seed_official();
 
     // Single stdout writer task + the cloneable emitter.
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -85,10 +98,8 @@ fn load_or_create_master(path: &std::path::Path) -> Result<[u8; 32]> {
             .map_err(|_| anyhow!("master.key has an unexpected size (expected 32 bytes)"))
     } else {
         let key = cherm_crypto::gen_master_key();
-        std::fs::write(path, key)?;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        // The master key decrypts every vault — write it atomically owner-only.
+        cherm_crypto::write_secret_file(path, &key)?;
         Ok(key)
     }
 }

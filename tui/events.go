@@ -2,6 +2,39 @@ package main
 
 import "encoding/json"
 
+// Widget is one declarative TUI widget contributed by an active plugin
+// (architecture_specification §6.5). The client renders only slots/kinds it
+// knows; anything else is ignored (bounded by the client).
+type Widget struct {
+	Slot   string `json:"slot"` // top_left | top_right | status
+	Kind   string `json:"kind"` // clock | text
+	Value  string `json:"value,omitempty"`
+	Format string `json:"format,omitempty"` // Go time layout for kind=clock
+}
+
+// PluginPerm is one declared permission plus its human explanation, shown before
+// install (architecture_specification §6.6).
+type PluginPerm struct {
+	ID   string `json:"id"`
+	Help string `json:"help"`
+}
+
+// StorePlugin is one entry in the plugin store / installed list.
+type StorePlugin struct {
+	Name        string       `json:"name"`
+	DisplayName string       `json:"display_name"`
+	Version     string       `json:"version"`
+	Kind        string       `json:"kind"`
+	Category    string       `json:"category"` // official|community_audited|community_unaudited
+	Description string       `json:"description"`
+	Author      string       `json:"author"`
+	License     string       `json:"license"`
+	SourceURL   string       `json:"source_url"`
+	Permissions []PluginPerm `json:"permissions"`
+	Installed   bool         `json:"installed"`
+	Active      bool         `json:"active"`
+}
+
 // This file defines the event types that flow from the cherm-core subprocess
 // (over stdout NDJSON) into the bubbletea program as tea.Msg values.
 //
@@ -13,7 +46,8 @@ import "encoding/json"
 // events). Username is the empty string when no account exists on that server.
 type ServerInfo struct {
 	ID       string `json:"id"`
-	Addr     string `json:"addr"`
+	Addr     string `json:"addr"`    // host:port used for connections (internal)
+	Name     string `json:"name"`    // user-defined display label (shown in the list)
 	Tier     string `json:"tier"`    // "unsigned" | "software" | "tee"
 	Verdict  string `json:"verdict"` // "green" | "yellow" | "red"
 	Username string `json:"username"`
@@ -34,15 +68,73 @@ type Message struct {
 	Text     string `json:"text"`
 	Ts       int64  `json:"ts"` // unix millis
 	Outgoing bool   `json:"outgoing"`
-	Color    string `json:"color,omitempty"` // reserved for premium; "" => white
+	Color    string `json:"color,omitempty"`  // reserved for premium; "" => white
 	System   bool   `json:"system,omitempty"` // a "✣ System" event (e.g. a leave notice)
 }
 
 // --- typed tea.Msg values delivered to the model ---
 
 type readyMsg struct {
-	servers   []ServerInfo
-	hasMaster bool
+	servers       []ServerInfo
+	hasMaster     bool
+	clientVersion string
+}
+
+// --- plugin / theme / update / maintenance messages ---
+
+type themeMsg struct {
+	palette json.RawMessage // null/empty => revert to default
+}
+
+type widgetsMsg struct {
+	widgets []Widget
+}
+
+type storePluginsMsg struct {
+	plugins []StorePlugin
+}
+
+type installedPluginsMsg struct {
+	plugins []StorePlugin
+}
+
+type pluginInstalledMsg struct {
+	name     string
+	version  string
+	category string
+}
+
+type pluginUpdateMsg struct {
+	name     string
+	current  string
+	latest   string
+	category string
+}
+
+type pluginSubmittedMsg struct {
+	name    string
+	version string
+}
+
+type clientUpdateMsg struct {
+	current  string
+	latest   string
+	notesURL string
+	url      string
+	channel  string
+}
+
+type maintenanceMsg struct {
+	server     string
+	reason     string
+	deadlineMs int64
+	version    string
+}
+
+// openChatMsg asks the TUI to open a chat directly (e.g. right after /dm or
+// /group), so the user lands in the conversation without picking it from the list.
+type openChatMsg struct {
+	chat string
 }
 
 type serversMsg struct {
@@ -139,8 +231,23 @@ type coreEvent struct {
 	Event string `json:"event"`
 
 	// ready / servers
-	Servers   []ServerInfo `json:"servers"`
-	HasMaster bool         `json:"has_master"`
+	Servers       []ServerInfo `json:"servers"`
+	HasMaster     bool         `json:"has_master"`
+	ClientVersion string       `json:"client_version"`
+
+	// plugins / theme / widgets / updates
+	Plugins    []StorePlugin   `json:"plugins"`
+	Palette    json.RawMessage `json:"palette"`
+	Widgets    []Widget        `json:"widgets"`
+	Name       string          `json:"name"`     // plugin name
+	Version    string          `json:"version"`  // plugin/server version
+	Category   string          `json:"category"` // plugin trust tier
+	Current    string          `json:"current"`
+	Latest     string          `json:"latest"`
+	NotesURL   string          `json:"notes_url"`
+	URL        string          `json:"url"`
+	Channel    string          `json:"channel"`
+	DeadlineMs int64           `json:"deadline_ms"`
 
 	// identity / connection state
 	Username string `json:"username"`
@@ -195,9 +302,29 @@ func parseEvent(line []byte) any {
 	}
 	switch e.Event {
 	case "ready":
-		return readyMsg{servers: e.Servers, hasMaster: e.HasMaster}
+		return readyMsg{servers: e.Servers, hasMaster: e.HasMaster, clientVersion: e.ClientVersion}
 	case "servers":
 		return serversMsg{servers: e.Servers}
+	case "theme":
+		return themeMsg{palette: e.Palette}
+	case "widgets":
+		return widgetsMsg{widgets: e.Widgets}
+	case "store_plugins":
+		return storePluginsMsg{plugins: e.Plugins}
+	case "installed_plugins":
+		return installedPluginsMsg{plugins: e.Plugins}
+	case "plugin_installed":
+		return pluginInstalledMsg{name: e.Name, version: e.Version, category: e.Category}
+	case "plugin_update_available":
+		return pluginUpdateMsg{name: e.Name, current: e.Current, latest: e.Latest, category: e.Category}
+	case "plugin_submitted":
+		return pluginSubmittedMsg{name: e.Name, version: e.Version}
+	case "client_update_available":
+		return clientUpdateMsg{current: e.Current, latest: e.Latest, notesURL: e.NotesURL, url: e.URL, channel: e.Channel}
+	case "maintenance":
+		return maintenanceMsg{server: e.Server, reason: e.Reason, deadlineMs: e.DeadlineMs, version: e.Version}
+	case "open_chat":
+		return openChatMsg{chat: e.Chat}
 	case "attest":
 		return attestMsg{
 			server:            e.Server,

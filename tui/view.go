@@ -54,16 +54,21 @@ func (m Model) serversView() string {
 	}
 	for i, s := range m.servers {
 		cursor := "  "
-		addrStyle := menuLabel
+		nameStyle := menuLabel
 		if i == m.serverSel {
 			cursor = menuSel.Render("▸ ")
-			addrStyle = menuSel
+			nameStyle = menuSel
+		}
+		// Show the friendly name (the user never has to read host:port).
+		label := s.Name
+		if label == "" {
+			label = s.Addr
 		}
 		who := s.Username
 		if who == "" {
 			who = "(no account)"
 		}
-		line := cursor + addrStyle.Render(s.Addr) + " " +
+		line := cursor + nameStyle.Render(label) + " " +
 			verdictBadge(s.Verdict, s.Tier) + "  " + footerStyle.Render(who)
 		if s.Active {
 			line += " " + badgeOn.Render("active")
@@ -72,28 +77,12 @@ func (m Model) serversView() string {
 	}
 
 	b.WriteString("\n" + m.statusLine())
-	b.WriteString("\n" + footerStyle.Render("↑/↓ move · enter connect · a add server · esc chat · q quit"))
+	b.WriteString("\n" + footerStyle.Render("↑/↓ move · enter connect · a add · x remove · esc chat · q quit"))
 
 	return m.center(panelStyle().Width(64).Render(b.String()))
 }
 
-// ---- add server ----
-
-// addServerView renders the host:port editor.
-func (m Model) addServerView() string {
-	var b strings.Builder
-	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true) + "\n\n")
-	b.WriteString(menuLabel.Render("add a server"))
-	b.WriteString(footerStyle.Render("  (it will be attested before you connect)") + "\n\n")
-	b.WriteString(menuKey.Render("host:port") + "\n")
-	b.WriteString(m.serverInput.View() + "\n")
-	if m.checking {
-		b.WriteString("\n" + statusStyle.Render("checking...") + "\n")
-	}
-	b.WriteString("\n" + footerStyle.Render("enter: check & attest   ·   esc: back"))
-
-	return m.center(panelStyle().Width(56).Render(b.String()))
-}
+// ---- add server (addServerView lives in addserver.go) ----
 
 // ---- verdict ----
 
@@ -210,22 +199,52 @@ func (m Model) leaveConfirmView() string {
 	return m.center(panelStyle().Width(48).Render(b.String()))
 }
 
+// removeServerConfirmView renders the "Remove this server?" confirmation with
+// Remove / Cancel buttons (Cancel selected by default — removal is destructive:
+// it deletes the local encrypted vault for that server).
+func (m Model) removeServerConfirmView() string {
+	var b strings.Builder
+	b.WriteString(gradientText("✦ cherm.chat", hexMagenta, hexPink, true) + "\n\n")
+	b.WriteString(menuLabel.Render("Remove this server?") + "\n")
+	b.WriteString(footerStyle.Render(m.removeServerAddr) + "\n")
+	b.WriteString(errStyle.Render("this deletes its local vault (identity + history)") + "\n\n")
+	b.WriteString(renderButtons(m.removeSel, "Remove", "Cancel", false))
+	b.WriteString("\n\n" + footerStyle.Render("←/→ or tab: move · enter: select · esc: cancel"))
+	return m.center(panelStyle().Width(52).Render(b.String()))
+}
+
 // ---- chat ----
 
-// chatView renders the header + sidebar + message pane + input + footer layout.
+// chatView renders the header + optional banners + sidebar + message pane +
+// input + footer layout.
 func (m Model) chatView() string {
 	header := m.headerView()
 	sidebar := m.sidebarView()
 	mainPane := m.mainPaneView()
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainPane)
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, m.footerView())
+
+	parts := []string{header}
+	// Local, never-stored banners: server maintenance countdown / waiting state,
+	// then any available client update.
+	if banner := m.maintenanceBanner(); banner != "" {
+		parts = append(parts, banner)
+	}
+	if banner := m.clientUpdateBanner(); banner != "" {
+		parts = append(parts, banner)
+	}
+	parts = append(parts, body, m.footerView())
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // headerView is the slim top bar: gradient logo on the left, an optional safety
 // number for the open DM, connection badge + user@server + a menu hint.
 func (m Model) headerView() string {
 	logo := gradientText("✦ cherm.chat", hexMagenta, hexPink, true)
+	// Plugin-provided top-left widgets (declarative, bounded by the client).
+	for _, w := range m.widgetsForSlot("top_left") {
+		logo += "  " + w
+	}
 
 	badge := badgeOff.Render("offline")
 	if m.connected {
@@ -237,9 +256,14 @@ func (m Model) headerView() string {
 	}
 	info := ""
 	if fp := m.currentFingerprint(); fp != "" {
-		info = footerStyle.Render("🔒 " + truncate(fp, 16) + "  ")
+		info = lockStyle.Render("ꄗ ") + footerStyle.Render(truncate(fp, 16)+"  ")
 	}
-	right := info + badge + footerStyle.Render(" "+who+" @ "+m.serverAddr+"  esc: menu")
+	// Plugin-provided top-right widgets (e.g. a clock).
+	widget := ""
+	for _, w := range m.widgetsForSlot("top_right") {
+		widget += w + "  "
+	}
+	right := widget + info + badge + footerStyle.Render(" "+who+" @ "+m.displayServer()+"  esc: menu")
 
 	if m.width <= 0 {
 		return logo + "   " + right
@@ -331,8 +355,12 @@ func (m Model) footerView() string {
 	if status != "" {
 		line1 = footerStyle.Render(left+"  |  ") + style.Render(status)
 	}
+	// Plugin-provided status-bar widgets append to the right of the status line.
+	for _, w := range m.widgetsForSlot("status") {
+		line1 += footerStyle.Render("  ·  ") + w
+	}
 
-	hint := "/dm  /group  /servers  /menu  /help  /quit  ·  tab: focus  ·  x: leave  ·  esc: menu  ·  enter: open/send"
+	hint := "/dm  /group  /store  /servers  /menu  /help  ·  tab focus  ·  x leave  ·  esc menu  ·  enter open/send"
 	line2 := footerStyle.Render(hint)
 
 	out := lipgloss.JoinVertical(lipgloss.Left, line1, line2)
@@ -375,7 +403,7 @@ func (m Model) menuView() string {
 		who = "-"
 	}
 
-	b.WriteString(infoRow("server", m.serverAddr+"  "+conn))
+	b.WriteString(infoRow("server", m.displayServer()+"  "+conn))
 	b.WriteString(infoRow("ping", ping))
 	b.WriteString(infoRow("user", who))
 	if m.uuid != "" {
@@ -413,6 +441,11 @@ func (m Model) helpView() string {
 	b.WriteString(helpRow("/dm <user>", "start or open a 1:1 chat"))
 	b.WriteString(helpRow("/group <name> <u...>", "create a group"))
 	b.WriteString(helpRow("/servers", "switch / add a server"))
+	b.WriteString(helpRow("/store", "browse & install plugins"))
+	b.WriteString(helpRow("/submit", "submit a plugin to the store"))
+	b.WriteString(helpRow("/update", "check for a newer client"))
+	b.WriteString(helpRow("/export", "back up your account key to a file"))
+	b.WriteString(helpRow("/import <file>", "restore an account key"))
 	b.WriteString(helpRow("/menu", "server, ping, docs"))
 	b.WriteString(helpRow("/help", "show this help"))
 	b.WriteString(helpRow("/quit", "exit"))

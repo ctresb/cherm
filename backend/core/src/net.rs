@@ -201,6 +201,23 @@ pub fn spawn_reader(
                         client_ts,
                     });
                 }
+                // Server-pushed maintenance/update notice — UNSOLICITED, so it
+                // must NOT consume the pending control oneshot. Surface it as a
+                // `maintenance` event; the TUI renders a LOCAL countdown to the
+                // deadline (not 60 chat lines), then enters waiting-for-server.
+                ServerMsg::Maintenance {
+                    reason,
+                    deadline_unix_ms,
+                    version,
+                } => {
+                    events.emit(json!({
+                        "event": "maintenance",
+                        "server": addr,
+                        "reason": reason,
+                        "deadline_ms": deadline_unix_ms,
+                        "version": version,
+                    }));
+                }
                 other => {
                     let mut slot = pending.lock().await;
                     if let Some(tx) = slot.take() {

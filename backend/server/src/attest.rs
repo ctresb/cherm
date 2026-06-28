@@ -93,20 +93,10 @@ fn load_or_create_instance_key(path: &Path) -> Result<InstanceKey> {
         Ok(key)
     } else {
         let key = InstanceKey::generate();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating directory {}", parent.display()))?;
-            }
-        }
-        std::fs::write(path, key.to_secret_b64())
+        // The instance key is the server's signing secret — write it atomically
+        // owner-only (0600, parent 0700), failing loudly if it can't be enforced.
+        cherm_crypto::write_secret_file(path, key.to_secret_b64().as_bytes())
             .with_context(|| format!("writing instance key {}", path.display()))?;
-        // Best-effort: a private key should not be world-readable.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
         Ok(key)
     }
 }

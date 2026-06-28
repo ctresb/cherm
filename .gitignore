@@ -12,6 +12,17 @@
 *.db-wal
 /cherm-server.db
 
+# Secrets / keys (never commit)
+/instance.key
+*.chermkey
+*.key
+
+# Built release artifacts (binaries are published to R2, not git)
+/deploy/dist/releases/
+
+# Wrangler local cache (account metadata)
+**/.wrangler/
+
 # Editor / OS
 .DS_Store
 *.swp

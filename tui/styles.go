@@ -11,67 +11,142 @@ import (
 // so the presentation of the shell can evolve independently of the protocol's
 // fixed message format. Message bubbles stay white (premium-gated, PROTOCOL.md
 // section 6); the palette below only dresses the surrounding UI.
+//
+// THEMING (architecture_specification §6.1 — "a theme is a plugin"): the palette
+// is a RUNTIME value, not a set of constants. It is loaded from the active theme
+// plugin's `active-theme.json` at startup and re-applied live when the core emits
+// a `theme` event after a theme plugin is installed/removed. Every palette-derived
+// style is (re)assigned in applyPalette so a theme change takes effect on the next
+// render without a restart. bubbletea serializes Update/View on one goroutine, so
+// mutating these package globals from Update (a themeMsg) is safe.
 
-// Palette (user-provided): magenta -> pink accent, near-black base, white text.
-const (
+// hex* are the ACTIVE palette hexes (mutated by applyPalette). Defaults mirror
+// the original magenta→pink accent on a near-black base.
+var (
 	hexMagenta = "#EE00FF"
 	hexPink    = "#FF007B"
 	hexDark    = "#17191D"
 	hexWhite   = "#FFFFFF"
 )
 
+// Active palette colors (assigned by applyPalette).
 var (
-	cMagenta = lipgloss.Color(hexMagenta)
-	cPink    = lipgloss.Color(hexPink)
-	cDark    = lipgloss.Color(hexDark)
-	cWhite   = lipgloss.Color(hexWhite)
-	// cBorder is a dim, magenta-tinted border for unfocused panes; cMuted is
-	// low-emphasis text.
-	cBorder = lipgloss.Color("#3A2E3F")
-	cMuted  = lipgloss.Color("#8A8D93")
-
-	// verdict colors (attestation traffic-light: green tee / yellow software /
-	// red). Semantic only — they dress the attestation UI and never the chat
-	// bubbles, which stay white per PROTOCOL.md section 6.
-	cGreen  = lipgloss.Color("#2ECC71")
-	cYellow = lipgloss.Color("#F1C40F")
-	cRed    = lipgloss.Color("#E74C3C")
+	cMagenta lipgloss.Color
+	cPink    lipgloss.Color
+	cDark    lipgloss.Color
+	cWhite   lipgloss.Color
+	cBorder  lipgloss.Color
+	cMuted   lipgloss.Color
+	cGreen   lipgloss.Color
+	cYellow  lipgloss.Color
+	cRed     lipgloss.Color
 
 	// colorAccent is the primary accent (focused borders, selections).
+	colorAccent lipgloss.Color
+)
+
+// Palette-derived styles. Declared bare (zero value) and assigned in
+// applyPalette — never initialized at declaration, or they would capture the
+// zero-value colors before applyPalette runs.
+var (
+	titleStyle lipgloss.Style
+
+	itemStyle     lipgloss.Style
+	selectedStyle lipgloss.Style
+	activityStyle lipgloss.Style
+
+	footerStyle lipgloss.Style
+	statusStyle lipgloss.Style
+	errStyle    lipgloss.Style
+
+	badgeOn   lipgloss.Style
+	badgeOff  lipgloss.Style
+	menuKey   lipgloss.Style
+	menuLabel lipgloss.Style
+	menuSel   lipgloss.Style
+
+	badgeGreen  lipgloss.Style
+	badgeYellow lipgloss.Style
+	badgeRed    lipgloss.Style
+	greenText   lipgloss.Style
+	yellowText  lipgloss.Style
+	redText     lipgloss.Style
+
+	linkStyle lipgloss.Style
+
+	// system message styles (used by render.go).
+	systemPrefixStyle lipgloss.Style
+	systemBodyStyle   lipgloss.Style
+
+	// plugin category badges.
+	badgeOfficial   lipgloss.Style
+	badgeAudited    lipgloss.Style
+	badgeUnaudited  lipgloss.Style
+	badgeWidgetText lipgloss.Style
+
+	// lockStyle marks the safety-number / secure indicator (bold gold) — used
+	// instead of an emoji (the UI uses no emoji).
+	lockStyle lipgloss.Style
+)
+
+// init applies the active theme (from disk, falling back to the default palette)
+// before the first render. Runs after package var initialization, before main.
+func init() {
+	applyPalette(loadPaletteFromDisk())
+}
+
+// applyPalette recomputes every palette-derived color + style from p. Called at
+// startup and again on each live `theme` event so theme plugins re-skin the TUI.
+func applyPalette(p Palette) {
+	hexMagenta, hexPink, hexDark, hexWhite = p.Magenta, p.Pink, p.Dark, p.White
+
+	cMagenta = lipgloss.Color(p.Magenta)
+	cPink = lipgloss.Color(p.Pink)
+	cDark = lipgloss.Color(p.Dark)
+	cWhite = lipgloss.Color(p.White)
+	cBorder = lipgloss.Color(p.Border)
+	cMuted = lipgloss.Color(p.Muted)
+	cGreen = lipgloss.Color(p.Green)
+	cYellow = lipgloss.Color(p.Yellow)
+	cRed = lipgloss.Color(p.Red)
 	colorAccent = cMagenta
 
-	// titleStyle heads the sidebar / panels.
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(cMagenta)
 
-	// sidebar item styles.
-	itemStyle     = lipgloss.NewStyle().Foreground(cWhite)
+	itemStyle = lipgloss.NewStyle().Foreground(cWhite)
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(cDark).Background(cMagenta)
 	activityStyle = lipgloss.NewStyle().Foreground(cPink).Bold(true)
 
-	// footer + transient status line.
 	footerStyle = lipgloss.NewStyle().Foreground(cMuted)
 	statusStyle = lipgloss.NewStyle().Foreground(cMagenta)
-	errStyle    = lipgloss.NewStyle().Foreground(cPink)
+	errStyle = lipgloss.NewStyle().Foreground(cPink)
 
-	// header + menu styles.
-	badgeOn   = lipgloss.NewStyle().Foreground(cDark).Background(cMagenta).Bold(true).Padding(0, 1)
-	badgeOff  = lipgloss.NewStyle().Foreground(cWhite).Background(cBorder).Padding(0, 1)
-	menuKey   = lipgloss.NewStyle().Foreground(cMuted)
+	badgeOn = lipgloss.NewStyle().Foreground(cDark).Background(cMagenta).Bold(true).Padding(0, 1)
+	badgeOff = lipgloss.NewStyle().Foreground(cWhite).Background(cBorder).Padding(0, 1)
+	menuKey = lipgloss.NewStyle().Foreground(cMuted)
 	menuLabel = lipgloss.NewStyle().Foreground(cWhite)
-	menuSel   = lipgloss.NewStyle().Foreground(cPink).Bold(true)
+	menuSel = lipgloss.NewStyle().Foreground(cPink).Bold(true)
 
-	// attestation verdict badges + body text.
-	badgeGreen  = lipgloss.NewStyle().Foreground(cDark).Background(cGreen).Bold(true).Padding(0, 1)
+	badgeGreen = lipgloss.NewStyle().Foreground(cDark).Background(cGreen).Bold(true).Padding(0, 1)
 	badgeYellow = lipgloss.NewStyle().Foreground(cDark).Background(cYellow).Bold(true).Padding(0, 1)
-	badgeRed    = lipgloss.NewStyle().Foreground(cWhite).Background(cRed).Bold(true).Padding(0, 1)
-	greenText   = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
-	yellowText  = lipgloss.NewStyle().Foreground(cYellow).Bold(true)
-	redText     = lipgloss.NewStyle().Foreground(cRed).Bold(true)
+	badgeRed = lipgloss.NewStyle().Foreground(cWhite).Background(cRed).Bold(true).Padding(0, 1)
+	greenText = lipgloss.NewStyle().Foreground(cGreen).Bold(true)
+	yellowText = lipgloss.NewStyle().Foreground(cYellow).Bold(true)
+	redText = lipgloss.NewStyle().Foreground(cRed).Bold(true)
 
-	// linkStyle highlights a clickable URL (the yellow "learn more" and the red
-	// "public codebase").
 	linkStyle = lipgloss.NewStyle().Foreground(cMagenta).Underline(true).Bold(true)
-)
+
+	systemPrefixStyle = lipgloss.NewStyle().Bold(true).Foreground(cPink)
+	systemBodyStyle = lipgloss.NewStyle().Faint(true).Italic(true)
+
+	// Plugin trust badges: official (accent), audited (green), unaudited (red —
+	// use-at-your-own-risk must read as a warning).
+	badgeOfficial = lipgloss.NewStyle().Foreground(cDark).Background(cMagenta).Bold(true).Padding(0, 1)
+	badgeAudited = lipgloss.NewStyle().Foreground(cDark).Background(cGreen).Bold(true).Padding(0, 1)
+	badgeUnaudited = lipgloss.NewStyle().Foreground(cWhite).Background(cRed).Bold(true).Padding(0, 1)
+	badgeWidgetText = lipgloss.NewStyle().Foreground(cMuted)
+	lockStyle = lipgloss.NewStyle().Bold(true).Foreground(cYellow)
+}
 
 // boxStyle returns a rounded-border box whose border color reflects focus.
 func boxStyle(focused bool) lipgloss.Style {

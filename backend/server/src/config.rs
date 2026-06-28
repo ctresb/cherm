@@ -26,6 +26,9 @@ pub type Shared = Arc<ServerConfig>;
 pub struct ServerConfig {
     /// Public display name of this server.
     pub name: String,
+    /// Public address users connect to (may differ from the listen address —
+    /// install_specification §10.4). E.g. `srv.cherm.chat:9000`. Display-only.
+    pub public_address: String,
     /// URL of the codebase this server claims to run (shown to users).
     pub repo_url: String,
     /// Free-text description.

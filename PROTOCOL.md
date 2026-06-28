@@ -72,6 +72,7 @@ TCP, length-prefixed JSON (4-byte big-endian length + JSON). Use
 | `ServerInfo` | `name, repo_url, description, contact, version` (operator-supplied) |
 | `Deliver` | `from, to:[String], msg_type, payload, group_id?, server_ts, client_ts` |
 | `Ok` | `detail?` · `Error` | `code,message` · `Pong` | — |
+| `Maintenance` | `reason, deadline_unix_ms, version?` | server is stopping for an update; broadcast to every online client. Clients render a **local** countdown to the deadline (UI state, not 60 chat lines), enter waiting-for-server, and auto-reconnect (install_specification §12). Triggered by `SIGUSR1` on the server. |
 
 `payload` is opaque base64. `msg_type`:
 - `"olm"` — an Olm message (DM text). Encoded `"<olm_type>.<base64 body>"`.
@@ -133,14 +134,25 @@ The core manages **many servers**; chat commands act on the **active** server.
 ### Commands (tui → core)
 ```
 {"cmd":"list_servers"}
-{"cmd":"check_server","server":"host:port"}        // connect pre-auth, attest, verify
+{"cmd":"check_server","server":"host:port","name":"cherm.chat"}  // attest; name is the list label
 {"cmd":"connect","server":"host:port"}             // make active; auth if username exists
 {"cmd":"register","server":"host:port","username":"alice"}   // create identity+vault on a server
 {"cmd":"switch_server","server":"host:port"}       // change active server
+{"cmd":"remove_server","server":"host:port"}       // forget a server + delete its vault (after confirm)
 {"cmd":"list_chats"} {"cmd":"history","chat":id,"limit":200}
 {"cmd":"start_dm","username":"bob"} {"cmd":"create_group","name":"x","members":[...]}
 {"cmd":"send","chat":id,"text":"hi"} {"cmd":"ping"} {"cmd":"quit"}
 {"cmd":"leave_chat","chat":id}                    // leave a DM or group (after a UI confirm)
+```
+Plugin store + updates (global; not server-scoped — see PLUGIN_POLICY.md):
+```
+{"cmd":"list_store"}                              // fetch the official store index
+{"cmd":"list_installed"}                          // local installed plugins
+{"cmd":"install_plugin","name":"pastel-theme"}    // download+verify(sha256)+activate
+{"cmd":"remove_plugin","name":"pastel-theme"}
+{"cmd":"check_plugin_updates"}                     // -> plugin_update_available per outdated
+{"cmd":"submit_plugin","manifest":{...},"package":{...}}  // -> store as community_unaudited
+{"cmd":"check_client_update"}                      // -> client_update_available if newer
 ```
 `start_dm` of your own username → `error` (`code:"self_dm"`). `leave_chat`
 notifies the other side with an `*_system` message, then deletes the chat (and
@@ -149,7 +161,7 @@ its sessions) from the local vault.
 ### Events (core → tui)
 ```
 {"event":"ready","servers":[...],"has_master":true}
-{"event":"servers","servers":[{"id","addr","tier","verdict","username":string|null,"active":bool}]}
+{"event":"servers","servers":[{"id","addr","name","tier","verdict","username":string|null,"active":bool}]}
 {"event":"attest","server":addr,"verdict":"green|yellow|red","tier":"unsigned|software|tee",
    "reason":...,"build_hash":...,"fingerprint":...,
    "public_codebase_url":...,"signatures_url":...,
@@ -165,6 +177,23 @@ its sessions) from the local vault.
 {"event":"error","message":...,"code":...} {"event":"info","message":...}
 {"event":"pong","rtt_ms":N,"server":addr}
 ```
+Plugin / theme / update / maintenance events (the TUI renders these locally):
+```
+{"event":"theme","palette":{magenta,pink,dark,white,border,muted,green,yellow,red}|null}
+{"event":"widgets","widgets":[{"slot":"top_right","kind":"clock","format":"15:04:05"}]}
+{"event":"store_plugins","plugins":[{name,version,kind,category,permissions:[{id,help}],...}]}
+{"event":"installed_plugins","plugins":[...]}
+{"event":"plugin_installed","name","version","category"}
+{"event":"plugin_update_available","name","current","latest","category"}
+{"event":"plugin_submitted","name","version","category":"community_unaudited"}
+{"event":"client_update_available","current","latest","notes_url","url","channel"}
+{"event":"maintenance","server":addr,"reason","deadline_ms","version"}  // local 60s countdown
+```
+`theme` with `palette:null` reverts to the default palette. The active theme is
+also written to `~/.cherm/plugins/active-theme.json`, which the TUI reads at
+startup for the first frame. Category ∈ `official | community_audited |
+community_unaudited`; the client shows the tier (and a use-at-your-own-risk
+warning for unaudited) before install.
 `color` stays `null` (premium-gated). The verdict drives the add-server UI
 (🟢 Cancel/Connect; 🟡 + learn-more `signatures_url` + Cancel/Connect;
 🔴 + clickable `public_codebase_url` + Cancel/Connect-anyway[10s countdown]).

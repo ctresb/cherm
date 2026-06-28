@@ -171,6 +171,18 @@ pub enum ServerMsg {
     Error { code: String, message: String },
     /// Liveness response.
     Pong,
+    /// Server is about to stop for maintenance/update. Broadcast to every online
+    /// client so they can render a *local* countdown to `deadline_unix_ms` (NOT
+    /// 60 separate chat messages — this is UI state), enter a waiting-for-server
+    /// state, and reconnect automatically once the server returns. `version` is
+    /// the release being deployed, when known.
+    Maintenance {
+        reason: String,
+        /// Unix-millis deadline after which the server stops accepting traffic.
+        deadline_unix_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
 }
 
 /// Stable error codes the server returns in [`ServerMsg::Error`].

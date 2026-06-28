@@ -22,14 +22,13 @@ import (
 const timeLayout = "02/01/06 - 15:04:05"
 
 var (
-	// prefixStyle is the bold "[name][time]> " header style.
+	// prefixStyle is the bold "[name][time]> " header style (palette-independent).
 	prefixStyle = lipgloss.NewStyle().Bold(true)
 	// bodyStyle is the normal-weight message body style.
 	bodyStyle = lipgloss.NewStyle()
-	// system message styles: accented prefix + muted italic body, so a "✣ System"
-	// line is visually distinct from user chat (which stays white).
-	systemPrefixStyle = lipgloss.NewStyle().Bold(true).Foreground(cPink)
-	systemBodyStyle   = lipgloss.NewStyle().Faint(true).Italic(true)
+	// systemPrefixStyle / systemBodyStyle are palette-derived and assigned in
+	// applyPalette (styles.go): accented prefix + muted italic body, so a
+	// "✣ System" line is visually distinct from user chat (which stays white).
 )
 
 // renderMessage formats one message bubble.

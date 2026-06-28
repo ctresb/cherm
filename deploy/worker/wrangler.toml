@@ -1,0 +1,21 @@
+name = "cherm-edge"
+main = "cherm-edge.js"
+compatibility_date = "2024-11-01"
+
+# R2-backed distribution + plugin store.
+[[r2_buckets]]
+binding = "DIST"
+bucket_name = "cherm-dist"
+
+[[r2_buckets]]
+binding = "PLUGINS"
+bucket_name = "cherm-plugins"
+
+# Custom domains (provisions DNS + TLS via the Workers platform).
+[[routes]]
+pattern = "cherm.chat"
+custom_domain = true
+
+[[routes]]
+pattern = "plugins.cherm.chat"
+custom_domain = true

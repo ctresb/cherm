@@ -24,11 +24,13 @@ mod db;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use cherm_proto::ServerMsg;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::conn::{Db, Online};
@@ -36,6 +38,10 @@ use crate::conn::{Db, Online};
 /// Default advertised release version when neither `--version` nor the
 /// `CHERM_VERSION` environment variable is set.
 const DEFAULT_VERSION: &str = "0.1.0+dev";
+
+/// Default maintenance-warning window (seconds) clients count down before a
+/// graceful update stop (install_specification §12.3).
+const DEFAULT_MAINTENANCE_WARNING: u64 = 60;
 
 /// Command-line configuration, parsed by hand (no clap dependency).
 struct Config {
@@ -46,6 +52,7 @@ struct Config {
     instance_key: Option<String>,
     version: Option<String>,
     config: Option<String>,
+    maintenance_warning: u64,
 }
 
 impl Config {
@@ -61,6 +68,7 @@ impl Config {
         let mut instance_key = None;
         let mut version = None;
         let mut config = None;
+        let mut maintenance_warning = DEFAULT_MAINTENANCE_WARNING;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -79,6 +87,11 @@ impl Config {
                 "--instance-key" => instance_key = args.next(),
                 "--version" => version = args.next(),
                 "--config" => config = args.next(),
+                "--maintenance-warning" => {
+                    if let Some(v) = args.next().and_then(|s| s.parse().ok()) {
+                        maintenance_warning = v;
+                    }
+                }
                 other => {
                     eprintln!("warning: ignoring unknown argument: {other}");
                 }
@@ -92,6 +105,7 @@ impl Config {
             instance_key,
             version,
             config,
+            maintenance_warning,
         }
     }
 
@@ -171,7 +185,34 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&cfg.addr)
         .await
         .with_context(|| format!("binding {}", cfg.addr))?;
-    info!(addr = %cfg.addr, db = %cfg.db, "cherm relay listening");
+
+    // Startup banner (install_specification §11.4): clear enough for an operator
+    // to confirm the server is running correctly. Logs go to stderr.
+    let tier = if attestor.no_attest() { "unsigned" } else { "software" };
+    info!(
+        name = %server_config.name,
+        version = %attestor.version(),
+        public_address = %if server_config.public_address.is_empty() { cfg.addr.clone() } else { server_config.public_address.clone() },
+        listening = %cfg.addr,
+        db = %cfg.db,
+        client_acceptance = %if server_config.reject_unofficial_clients { "official-only" } else { "all clients" },
+        offline_queue = "encrypted, 72h max, delete-on-delivery/expiry",
+        maintenance_warning_s = cfg.maintenance_warning,
+        repo_url = %server_config.repo_url,
+        tier,
+        "cherm relay listening"
+    );
+
+    // `draining` flips true during a maintenance window so the accept loop stops
+    // admitting NEW connections while existing ones finish (install_specification
+    // §12.2 "stop accepting new connections").
+    let draining = Arc::new(AtomicBool::new(false));
+    spawn_maintenance_signal_handler(
+        online.clone(),
+        draining.clone(),
+        attestor.version().to_string(),
+        cfg.maintenance_warning,
+    );
 
     // Accept loop: a single misbehaving connection must never take down the
     // server, so per-connection work runs in its own task and accept errors are
@@ -184,6 +225,12 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+        // During a maintenance drain, refuse new connections (close immediately)
+        // so no client joins mid-update; existing clients keep their session.
+        if draining.load(Ordering::SeqCst) {
+            drop(stream);
+            continue;
+        }
         let _ = stream.set_nodelay(true);
         let online = online.clone();
         let database = database.clone();
@@ -193,4 +240,74 @@ async fn main() -> Result<()> {
             conn::handle(stream, peer, online, database, attestor, server_config).await;
         });
     }
+}
+
+/// Install a SIGUSR1 handler that runs the graceful maintenance/update stop
+/// (install_specification §12): broadcast a single `Maintenance` event with a
+/// deadline to every online client (so each renders a LOCAL countdown — never 60
+/// chat lines), stop accepting new connections, wait the warning window so
+/// clients can finish and show the countdown, then exit cleanly. The supervisor
+/// (Docker `restart` / systemd / `update-server.sh`) replaces the binary and
+/// brings the server back; clients reconnect automatically.
+///
+/// On non-unix targets this is a no-op (the signal does not exist).
+fn spawn_maintenance_signal_handler(
+    online: Online,
+    draining: Arc<AtomicBool>,
+    version: String,
+    warning_secs: u64,
+) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGUSR1 handler; update broadcast disabled");
+                return;
+            }
+        };
+        while sig.recv().await.is_some() {
+            if draining.swap(true, Ordering::SeqCst) {
+                warn!("maintenance already in progress; ignoring repeat SIGUSR1");
+                continue;
+            }
+            let deadline = now_millis() + (warning_secs as i64) * 1000;
+            let notice = ServerMsg::Maintenance {
+                reason: format!("Server will stop in {warning_secs}s for update."),
+                deadline_unix_ms: deadline,
+                version: Some(version.clone()),
+            };
+            // Broadcast to every online client through its writer channel.
+            let count = {
+                let guard = online.lock().await;
+                for tx in guard.values() {
+                    let _ = tx.send(notice.clone());
+                }
+                guard.len()
+            };
+            info!(
+                clients = count,
+                warning_secs, "maintenance broadcast sent; draining, will exit for update"
+            );
+            // Give clients the warning window to show the countdown + prepare to
+            // wait, then exit so the supervisor can swap the binary and restart.
+            tokio::time::sleep(std::time::Duration::from_secs(warning_secs)).await;
+            info!("maintenance window elapsed; exiting for update");
+            std::process::exit(0);
+        }
+    });
+    #[cfg(not(unix))]
+    {
+        let _ = (online, draining, version, warning_secs);
+    }
+}
+
+/// Current unix time in milliseconds (mirrors `conn::now_millis`).
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

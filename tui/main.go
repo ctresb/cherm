@@ -13,6 +13,30 @@ import (
 )
 
 func main() {
+	// CLI flags handled before launching the TUI.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--update", "update":
+			force := false
+			for _, a := range os.Args[2:] {
+				if a == "--force" || a == "-f" {
+					force = true
+				}
+			}
+			os.Exit(runUpdateCLI(force))
+		case "--version", "-v", "version":
+			fmt.Printf("cherm %s\n", clientVersion)
+			os.Exit(0)
+		case "--help", "-h", "help":
+			fmt.Printf("cherm %s — terminal chat for cherm.chat\n\n", clientVersion)
+			fmt.Println("usage:")
+			fmt.Println("  cherm                 launch the TUI")
+			fmt.Println("  cherm --update [-f]   check for & install the latest client")
+			fmt.Println("  cherm --version       print version")
+			os.Exit(0)
+		}
+	}
+
 	core := NewCore()
 	model := NewModel(core)
 

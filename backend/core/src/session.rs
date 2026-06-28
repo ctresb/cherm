@@ -19,8 +19,9 @@ use tokio::task::JoinHandle;
 
 use crate::ipc::{err_event, Command, Events};
 use crate::net::{self, ServerLink};
+use crate::plugins::{Manifest, Plugins};
 use crate::vault::{self, Vault};
-use crate::{attest_client, now_millis};
+use crate::{attest_client, now_millis, update};
 
 /// Number of one-time keys published per (re)connect.
 const PREKEY_BATCH: usize = 20;
@@ -37,6 +38,10 @@ const CLIENT_VERSION: &str = "0.1.0+dev";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerRecord {
     pub addr: String,
+    /// User-defined display label shown in the server list (so the user sees a
+    /// friendly name, not `host:port`). Defaults to the host when unset.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -77,6 +82,25 @@ impl ServerIndex {
     fn set_username(&mut self, addr: &str, username: &str) {
         self.record_mut(addr).username = Some(username.to_string());
     }
+
+    fn set_name(&mut self, addr: &str, name: &str) {
+        if !name.is_empty() {
+            self.record_mut(addr).name = Some(name.to_string());
+        }
+    }
+
+    /// Ensure the official Cherm server is always present in the list (named so
+    /// users connect without thinking about host:port). Idempotent; does not
+    /// override an existing name a user may have set.
+    pub fn seed_official(&mut self) {
+        const OFFICIAL_ADDR: &str = "srv.cherm.chat:9000";
+        const OFFICIAL_NAME: &str = "cherm.chat";
+        let existed = self.servers.iter().any(|s| s.addr == OFFICIAL_ADDR);
+        let r = self.record_mut(OFFICIAL_ADDR);
+        if !existed || r.name.is_none() {
+            r.name = Some(OFFICIAL_NAME.to_string());
+        }
+    }
 }
 
 // ===========================================================================
@@ -102,10 +126,12 @@ pub struct App {
     index: ServerIndex,
     servers: HashMap<String, Server>,
     active: Option<String>,
+    plugins: Plugins,
 }
 
 impl App {
     pub fn new(home: PathBuf, master: [u8; 32], events: Events, index: ServerIndex) -> Self {
+        let plugins = Plugins::new(&home, events.clone());
         App {
             home,
             master,
@@ -113,6 +139,7 @@ impl App {
             index,
             servers: HashMap::new(),
             active: None,
+            plugins,
         }
     }
 
@@ -120,6 +147,10 @@ impl App {
 
     pub async fn run(&mut self) -> Result<()> {
         self.emit_ready();
+        // Quietly attest all known servers so the list shows real verdicts
+        // (green/yellow/red) instead of "unchecked", without hijacking the UI to
+        // the verdict screen (that only happens on an explicit add/check).
+        self.refresh_verdicts().await;
 
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Some(line) = lines.next_line().await? {
@@ -150,10 +181,11 @@ impl App {
                 self.emit_servers();
                 Ok(())
             }
-            Command::CheckServer { server } => self.check_server(server).await,
+            Command::CheckServer { server, name } => self.check_server(server, name).await,
             Command::Connect { server } => self.connect(server).await,
             Command::Register { server, username } => self.register(server, username).await,
             Command::SwitchServer { server } => self.switch_server(server).await,
+            Command::RemoveServer { server } => self.remove_server(server),
             Command::ListChats => self.list_chats(),
             Command::History { chat, limit } => self.history(&chat, limit.unwrap_or(200)),
             Command::StartDm { username } => self.start_dm(username).await,
@@ -161,15 +193,77 @@ impl App {
             Command::Send { chat, text } => self.send(chat, text).await,
             Command::LeaveChat { chat } => self.leave_chat(chat).await,
             Command::Ping => self.ping().await,
+
+            // ---- plugin store / plugins ------------------------------------
+            Command::ListStore => self.plugins.list_store().await,
+            Command::ListInstalled => self.plugins.list_installed(),
+            Command::InstallPlugin { name } => self.plugins.install(&name).await,
+            Command::RemovePlugin { name } => self.plugins.remove(&name),
+            Command::CheckPluginUpdates => self.plugins.check_updates().await,
+            Command::SubmitPlugin { manifest, package } => {
+                match serde_json::from_value::<Manifest>(manifest) {
+                    Ok(m) => self.plugins.submit(m, package).await,
+                    Err(e) => {
+                        self.events.emit(err_event(
+                            "bad_submission",
+                            &format!("invalid plugin manifest: {e}"),
+                        ));
+                        Ok(())
+                    }
+                }
+            }
+
+            // ---- updates ---------------------------------------------------
+            Command::CheckClientUpdate => {
+                update::check_client_update(CLIENT_VERSION, &self.events).await
+            }
+
+            // ---- identity backup / recovery --------------------------------
+            Command::ExportIdentity => self.export_identity(),
+            Command::ImportIdentity { path } => self.import_identity(path),
+
             Command::Quit => self.quit().await,
         }
     }
 
     // -- commands -----------------------------------------------------------
 
+    /// Background attestation refresh: attest every known server (with a short
+    /// timeout so an unreachable host never stalls startup) and cache the
+    /// verdict/tier in the index, emitting a `servers` update so the list badges
+    /// become accurate. Deliberately does NOT emit an `attest` event (which would
+    /// pop the verdict screen) — this is a quiet badge refresh.
+    async fn refresh_verdicts(&mut self) {
+        let addrs: Vec<String> = self.index.servers.iter().map(|s| s.addr.clone()).collect();
+        let mut changed = false;
+        for addr in addrs {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                attest_client::check_server(&addr),
+            )
+            .await;
+            if let Ok(Ok(out)) = res {
+                self.index.set_attest(
+                    &addr,
+                    attest_client::verdict_str(out.verdict),
+                    attest_client::tier_str(out.tier),
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save_index();
+            self.emit_servers();
+        }
+    }
+
     /// `check_server` -> attest a server pre-auth and cache its verdict.
-    async fn check_server(&mut self, server: String) -> Result<()> {
+    async fn check_server(&mut self, server: String, name: Option<String>) -> Result<()> {
+        let server = normalize_addr(&server);
         self.index.ensure(&server);
+        if let Some(n) = name {
+            self.index.set_name(&server, n.trim());
+        }
         match attest_client::check_server(&server).await {
             Ok(out) => {
                 self.events.emit(json!({
@@ -203,6 +297,7 @@ impl App {
 
     /// `register` -> create identity + vault on a server and go live.
     async fn register(&mut self, server: String, username: String) -> Result<()> {
+        let server = normalize_addr(&server);
         if !valid_username(&username) {
             self.events.emit(err_event(
                 cherm_proto::errcode::USERNAME_INVALID,
@@ -289,6 +384,16 @@ impl App {
                 vault::save_account(&vault, &vk, &device)?;
                 let one_time_keys = to_otks(otks);
 
+                // Auto-back-up the brand-new identity to a 0600 file so the
+                // username can never be silently lost (recover with import).
+                match self.backup_identity(&server, &uname, &uuid, &device) {
+                    Ok(path) => self.events.emit(json!({
+                        "event": "info",
+                        "message": format!("identity backed up to {} (keep it safe)", path.display())
+                    })),
+                    Err(e) => tracing::warn!("identity backup failed: {e}"),
+                }
+
                 if let Some(s) = self.servers.get_mut(&server) {
                     s.link = Some(link.clone());
                     s.reader = Some(handle);
@@ -327,6 +432,7 @@ impl App {
     /// `connect` -> challenge-response auth with the stored identity, replenish
     /// prekeys, pull offline messages, and make active.
     async fn connect(&mut self, server: String) -> Result<()> {
+        let server = normalize_addr(&server);
         self.ensure_server(&server)?;
         let (vault, vk) = self.vault_of(&server);
 
@@ -445,6 +551,7 @@ impl App {
 
     /// `switch_server` -> make active and surface its chats (connecting if needed).
     async fn switch_server(&mut self, server: String) -> Result<()> {
+        let server = normalize_addr(&server);
         self.ensure_server(&server)?;
         self.prune_dead_links();
         self.active = Some(server.clone());
@@ -467,6 +574,154 @@ impl App {
             self.events.emit(vault::build_chats_event(&vault, &server)?);
             self.emit_servers();
         }
+        Ok(())
+    }
+
+    /// `remove_server` -> forget a server entirely (after a UI confirm): drop any
+    /// live link, remove it from the index, clear it if active, and delete its
+    /// per-server vault directory. Destructive: the identity + history for that
+    /// server are gone (the analog of leaving a chat, at server scope).
+    fn remove_server(&mut self, server: String) -> Result<()> {
+        let server = normalize_addr(&server);
+        self.teardown_link(&server);
+        self.servers.remove(&server);
+        if self.active.as_deref() == Some(server.as_str()) {
+            self.active = None;
+        }
+        self.index.servers.retain(|r| r.addr != server);
+        self.save_index()?;
+        // Delete the encrypted vault for this server (identity + history).
+        let id = cherm_crypto::server_id(&server);
+        let dir = self.home.join("servers").join(&id);
+        let _ = std::fs::remove_dir_all(&dir);
+        self.events
+            .emit(json!({"event": "info", "message": format!("removed server {server}")}));
+        self.emit_servers();
+        Ok(())
+    }
+
+    /// Write the identity for a `(server, username)` to a `0600` backup file so
+    /// the username can be recovered later (the file holds the PRIVATE key).
+    fn backup_identity(
+        &self,
+        server: &str,
+        username: &str,
+        uuid: &str,
+        device: &Device,
+    ) -> Result<std::path::PathBuf> {
+        let id = cherm_crypto::server_id(server);
+        let path = self
+            .home
+            .join("identity-backups")
+            .join(format!("{id}_{username}.chermkey"));
+        let blob = json!({
+            "cherm_identity": 1,
+            "server": server,
+            "username": username,
+            "uuid": uuid,
+            "ed25519": device.ed25519_b64(),
+            "account": device.export_pickle_json()?,
+        });
+        // The backup holds the PRIVATE key — write it atomically owner-only (the
+        // helper creates identity-backups/ 0700 and the file 0600, failing loudly
+        // if that cannot be enforced).
+        cherm_crypto::write_secret_file(&path, &serde_json::to_vec_pretty(&blob)?)?;
+        Ok(path)
+    }
+
+    /// `export_identity` -> back up the active server's identity to a file and
+    /// tell the user where it is.
+    fn export_identity(&mut self) -> Result<()> {
+        let (server, vault, vk) = match self.active_vault() {
+            Some(x) => x,
+            None => {
+                self.events.emit(err_event("not_connected", "no active server"));
+                return Ok(());
+            }
+        };
+        let username = match vault::meta_get(&vault, "username")? {
+            Some(u) => u,
+            None => {
+                self.events.emit(err_event("not_registered", "register first"));
+                return Ok(());
+            }
+        };
+        let uuid = vault::meta_get(&vault, "uuid")?.unwrap_or_default();
+        let device = match vault::load_account(&vault, &vk)? {
+            Some(d) => d,
+            None => {
+                self.events.emit(err_event("internal", "no identity in vault"));
+                return Ok(());
+            }
+        };
+        match self.backup_identity(&server, &username, &uuid, &device) {
+            Ok(path) => self.events.emit(json!({
+                "event": "info",
+                "message": format!("identity '{username}' exported to {} — keep it safe; it is your private key", path.display())
+            })),
+            Err(e) => self.events.emit(err_event("export_failed", &e.to_string())),
+        }
+        Ok(())
+    }
+
+    /// `import_identity` -> restore an identity from a backup file so the user can
+    /// log back in as that username (then they `connect` to authenticate).
+    fn import_identity(&mut self, path: String) -> Result<()> {
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.events
+                    .emit(err_event("import_failed", &format!("cannot read {path}: {e}")));
+                return Ok(());
+            }
+        };
+        let v: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                self.events
+                    .emit(err_event("import_failed", &format!("invalid identity file: {e}")));
+                return Ok(());
+            }
+        };
+        let server = normalize_addr(v["server"].as_str().unwrap_or(""));
+        let username = v["username"].as_str().unwrap_or("").to_string();
+        let account = v["account"].as_str().unwrap_or("");
+        if server.is_empty() || username.is_empty() || account.is_empty() {
+            self.events
+                .emit(err_event("import_failed", "incomplete identity file"));
+            return Ok(());
+        }
+        let device = match Device::from_pickle_json(account) {
+            Ok(d) => d,
+            Err(e) => {
+                self.events
+                    .emit(err_event("import_failed", &format!("bad identity key: {e}")));
+                return Ok(());
+            }
+        };
+        self.ensure_server(&server)?;
+        let (vault, vk) = self.vault_of(&server);
+        vault::save_account(&vault, &vk, &device)?;
+        vault::meta_set(&vault, "username", &username)?;
+        vault::meta_set(&vault, "server", &server)?;
+        let uuid = v["uuid"].as_str().unwrap_or("");
+        if !uuid.is_empty() {
+            vault::meta_set(&vault, "uuid", uuid)?;
+        }
+        vault::upsert_contact(
+            &vault,
+            &username,
+            uuid,
+            &device.ed25519_b64(),
+            &device.curve25519_b64(),
+        )?;
+        self.index.set_username(&server, &username);
+        self.save_index()?;
+        self.events.emit(json!({
+            "event": "info",
+            "message": format!("identity '{username}' imported on {server} — select it and Connect to log in")
+        }));
+        self.emit_servers();
         Ok(())
     }
 
@@ -552,6 +807,9 @@ impl App {
         }
         self.events.emit(vault::build_chats_event(&vault, &server)?);
         self.emit_history(&vault, &username, 200)?;
+        // Auto-open the new DM so the user lands in the conversation directly.
+        self.events
+            .emit(json!({"event": "open_chat", "chat": username}));
         Ok(())
     }
 
@@ -600,6 +858,9 @@ impl App {
             .await?;
 
         self.events.emit(vault::build_chats_event(&vault, &server)?);
+        // Auto-open the new group so the creator lands in it directly.
+        self.events
+            .emit(json!({"event": "open_chat", "chat": group_id}));
         Ok(())
     }
 
@@ -955,13 +1216,16 @@ impl App {
 
     // -- helpers ------------------------------------------------------------
 
-    /// Emit the initial `ready` event (the server list + master-key presence).
+    /// Emit the initial `ready` event (the server list + master-key presence),
+    /// then surface any active theme/widgets so the TUI applies them immediately.
     fn emit_ready(&self) {
         self.events.emit(json!({
             "event": "ready",
             "servers": self.servers_value(),
             "has_master": true,
+            "client_version": CLIENT_VERSION,
         }));
+        self.plugins.emit_active();
     }
 
     /// Emit the `servers` event.
@@ -979,6 +1243,7 @@ impl App {
                 json!({
                     "id": cherm_crypto::server_id(&r.addr),
                     "addr": r.addr,
+                    "name": r.name.clone().unwrap_or_else(|| host_of(&r.addr)),
                     "tier": r.tier.clone(),
                     "verdict": r.verdict.clone(),
                     "username": r.username.clone(),
@@ -1085,6 +1350,56 @@ fn to_otks(otks: Vec<(String, String)>) -> Vec<OneTimeKey> {
     otks.into_iter()
         .map(|(key_id, curve25519)| OneTimeKey { key_id, curve25519 })
         .collect()
+}
+
+/// The host portion of a `host:port` (everything before the last `:`), used as
+/// a fallback display name when no user-defined name is set.
+fn host_of(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => host.to_string(),
+        _ => addr.to_string(),
+    }
+}
+
+/// Normalize a user-typed server address into a connectable `host:port`.
+///
+/// The Cherm transport is raw TCP, not HTTP, so a pasted URL like
+/// `https://srv.cherm.chat` (or a bare `srv.cherm.chat` with no port) must become
+/// `srv.cherm.chat:9000`. This strips any scheme + path and appends the default
+/// port 9000 when none is present, so `TcpStream::connect` always gets a valid
+/// `host:port`. Idempotent. IPv6 literals (already containing `:`) are left as-is.
+pub fn normalize_addr(s: &str) -> String {
+    let mut s = s.trim();
+    if let Some(i) = s.find("://") {
+        s = &s[i + 3..];
+    }
+    if let Some(i) = s.find(['/', '?', '#']) {
+        s = &s[..i];
+    }
+    let s = s.trim();
+    if !s.is_empty() && !s.contains(':') {
+        format!("{s}:9000")
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_addr;
+
+    #[test]
+    fn normalizes_user_input() {
+        assert_eq!(normalize_addr("srv.cherm.chat"), "srv.cherm.chat:9000");
+        assert_eq!(normalize_addr("https://srv.cherm.chat"), "srv.cherm.chat:9000");
+        assert_eq!(normalize_addr("http://srv.cherm.chat/"), "srv.cherm.chat:9000");
+        assert_eq!(normalize_addr("https://srv.cherm.chat:9000"), "srv.cherm.chat:9000");
+        assert_eq!(normalize_addr("srv.cherm.chat:9000"), "srv.cherm.chat:9000");
+        assert_eq!(normalize_addr(" 127.0.0.1:4000 "), "127.0.0.1:4000");
+        assert_eq!(normalize_addr("srv.cherm.chat:9000/path?x"), "srv.cherm.chat:9000");
+        // idempotent
+        assert_eq!(normalize_addr(&normalize_addr("https://srv.cherm.chat")), "srv.cherm.chat:9000");
+    }
 }
 
 /// Best-effort device fingerprint (the machine's hostname).

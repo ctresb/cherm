@@ -86,6 +86,10 @@ const magentaSGR = "\x1b[38;2;238;0;255m"
 func TestRenderScreensAndPalette(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	defer lipgloss.SetColorProfile(termenv.ANSI)
+	// Pin the default palette so the assertion is deterministic regardless of any
+	// theme plugin active in the developer's ~/.cherm (init() loads it from disk).
+	applyPalette(defaultPalette())
+	defer applyPalette(loadPaletteFromDisk())
 
 	chatRaw := renderModel(screenChat).View()
 	chat := strip(chatRaw)
@@ -125,7 +129,7 @@ func TestRenderServerScreens(t *testing.T) {
 		{Addr: "relay.example:9000", Tier: "software", Verdict: "yellow", Username: ""},
 	}
 	servers := strip(m.View())
-	for _, want := range []string{"servers", "chat.cherm.example:9000", "tee", "relay.example:9000", "software", "(no account)", "active", "add server"} {
+	for _, want := range []string{"servers", "chat.cherm.example:9000", "tee", "relay.example:9000", "software", "(no account)", "active", "remove"} {
 		if !strings.Contains(servers, want) {
 			t.Errorf("servers view missing %q", want)
 		}
@@ -135,7 +139,7 @@ func TestRenderServerScreens(t *testing.T) {
 	a := renderModel(screenAddServer)
 	a.checking = true
 	add := strip(a.View())
-	for _, want := range []string{"add a server", "host:port", "checking..."} {
+	for _, want := range []string{"add a server", "address", "port", "name", "checking..."} {
 		if !strings.Contains(add, want) {
 			t.Errorf("add-server view missing %q", want)
 		}

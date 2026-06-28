@@ -116,6 +116,21 @@ impl Device {
         Ok((OlmSession { session: res.session }, res.plaintext))
     }
 
+    /// Export the FULL identity (including the private keys) as a portable JSON
+    /// string. This IS the secret — it is what lets you recover your username on
+    /// a new machine, so back it up safely (the core writes it to a `0600` file).
+    pub fn export_pickle_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.account.pickle())?)
+    }
+
+    /// Restore an identity from [`Device::export_pickle_json`] output.
+    pub fn from_pickle_json(json: &str) -> Result<Self> {
+        let pickle: AccountPickle = serde_json::from_str(json)?;
+        Ok(Device {
+            account: Account::from(pickle),
+        })
+    }
+
     /// Encrypt this account to an at-rest pickle blob.
     pub fn to_pickle_encrypted(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
         encrypt_blob(key, &serde_json::to_vec(&self.account.pickle())?)
@@ -293,6 +308,52 @@ impl GroupReceiver {
 // Vault keys (per-server at-rest encryption)
 // ===========================================================================
 
+/// Write secret bytes (private keys, identity backups) to `path` with
+/// owner-only permissions, created ATOMICALLY at mode 0600 — there is never a
+/// window where the file exists world-readable. The parent directory is created
+/// 0700 if missing. On unix it fails loudly if the restrictive mode cannot be
+/// enforced; on non-unix it writes with the platform default (the user profile
+/// directory is normally already owner-private).
+pub fn write_secret_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(data)?;
+        f.flush()?;
+        // Normalize the mode even if the file pre-existed with looser perms, and
+        // FAIL if owner-only cannot be enforced (don't silently leave a secret
+        // world-readable).
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("enforcing 0600 on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
 /// Generate a fresh 32-byte master key (stored at `~/.cherm/master.key`, 0600).
 pub fn gen_master_key() -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -408,6 +469,26 @@ mod tests {
         let sig = d.sign_b64(nonce);
         assert!(verify_ed25519_b64(&d.ed25519_b64(), nonce, &sig));
         assert!(!verify_ed25519_b64(&d.ed25519_b64(), b"other", &sig));
+    }
+
+    #[test]
+    fn identity_export_import_roundtrip() {
+        // Exporting + re-importing an identity preserves the keypair, so a user
+        // can recover their username on a fresh machine.
+        let mut d = Device::generate();
+        d.generate_one_time_keys(3);
+        d.mark_published();
+        let json = d.export_pickle_json().unwrap();
+        let restored = Device::from_pickle_json(&json).unwrap();
+        assert_eq!(d.ed25519_b64(), restored.ed25519_b64());
+        assert_eq!(d.curve25519_b64(), restored.curve25519_b64());
+        // The restored key signs identically (so server challenge-auth still works).
+        let nonce = b"server-nonce";
+        assert!(verify_ed25519_b64(
+            &restored.ed25519_b64(),
+            nonce,
+            &restored.sign_b64(nonce)
+        ));
     }
 
     #[test]

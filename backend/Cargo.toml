@@ -50,6 +50,10 @@ x509-cert = { version = "0.2", features = ["pem"] }
 minisign-verify = "0.2"
 blake3 = "1"
 hex = "0.4"
+# Plugin store / update client: HTTPS to plugins.cherm.chat & cherm.chat (rustls,
+# no system OpenSSL needed) — used by the core to fetch the store index, download
+# + verify plugin packages, submit plugins, and check for client updates.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Local crates
 cherm-proto = { path = "proto" }

@@ -21,14 +21,22 @@ use tokio::sync::{mpsc, oneshot};
 pub enum Command {
     /// `{"cmd":"list_servers"}`
     ListServers,
-    /// `{"cmd":"check_server","server":"host:port"}`
-    CheckServer { server: String },
+    /// `{"cmd":"check_server","server":"host:port","name":"cherm.chat"}`
+    CheckServer {
+        server: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// `{"cmd":"connect","server":"host:port"}`
     Connect { server: String },
     /// `{"cmd":"register","server":"host:port","username":"alice"}`
     Register { server: String, username: String },
     /// `{"cmd":"switch_server","server":"host:port"}`
     SwitchServer { server: String },
+    /// `{"cmd":"remove_server","server":"host:port"}` — forget a server: drop its
+    /// connection, remove it from the index, and delete its local vault (after a
+    /// UI confirm — this is destructive: identity + history for that server go).
+    RemoveServer { server: String },
     /// `{"cmd":"list_chats"}`
     ListChats,
     /// `{"cmd":"history","chat":"bob","limit":200}`
@@ -47,6 +55,38 @@ pub enum Command {
     LeaveChat { chat: String },
     /// `{"cmd":"ping"}`
     Ping,
+
+    // ---- plugin store / plugins (architecture_specification §6, §7) --------
+    /// `{"cmd":"list_store"}` — fetch the official plugin store index.
+    ListStore,
+    /// `{"cmd":"list_installed"}` — list locally-installed plugins.
+    ListInstalled,
+    /// `{"cmd":"install_plugin","name":"pastel-theme"}`
+    InstallPlugin { name: String },
+    /// `{"cmd":"remove_plugin","name":"pastel-theme"}`
+    RemovePlugin { name: String },
+    /// `{"cmd":"check_plugin_updates"}`
+    CheckPluginUpdates,
+    /// `{"cmd":"submit_plugin","manifest":{...},"package":{...}}` — submit a
+    /// plugin to the official store (lands as community_unaudited).
+    SubmitPlugin {
+        manifest: Value,
+        #[serde(default)]
+        package: Value,
+    },
+
+    // ---- updates (install_specification §8) --------------------------------
+    /// `{"cmd":"check_client_update"}` — check cherm.chat for a newer client.
+    CheckClientUpdate,
+
+    // ---- identity backup / recovery ---------------------------------------
+    /// `{"cmd":"export_identity"}` — write the active server's identity to a
+    /// `0600` backup file so the username can be recovered later.
+    ExportIdentity,
+    /// `{"cmd":"import_identity","path":"/path/to/file.chermkey"}` — restore an
+    /// identity from a backup so you can log back in as that username.
+    ImportIdentity { path: String },
+
     /// `{"cmd":"quit"}`
     Quit,
 }

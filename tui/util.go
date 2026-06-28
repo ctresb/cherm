@@ -40,6 +40,31 @@ func isReservedUsername(name string) bool {
 	return reservedUsernames[strings.ToLower(name)]
 }
 
+// normalizeServerAddr makes a user-typed server address connectable. The Cherm
+// transport is raw TCP (host:port), not HTTP, so a pasted "https://srv.cherm.chat"
+// must become "srv.cherm.chat:9000". It strips any URL scheme + path and appends
+// the default port 9000 when none was given.
+func normalizeServerAddr(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	// Strip a scheme like http:// or https://
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Drop any path / query the user may have pasted.
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	// Default port when the host has no ":port" (IPv6 literals are left as-is).
+	if s != "" && !strings.Contains(s, ":") {
+		s += ":9000"
+	}
+	return s
+}
+
 // envServer returns the server address override from CHERM_SERVER, if set.
 func envServer() string {
 	return os.Getenv("CHERM_SERVER")

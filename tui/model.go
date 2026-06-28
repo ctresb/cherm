@@ -15,14 +15,17 @@ import (
 type screen int
 
 const (
-	screenServers   screen = iota // home: list of known servers + verdict badges
-	screenAddServer               // textinput host:port -> check_server
-	screenVerdict                 // attestation verdict + Cancel/Connect buttons
-	screenUsername                // username registration on a server
-	screenChat                    // sidebar + messages + input
-	screenMenu                    // server / ping / change-server / docs
-	screenHelp                    // command + key reference
-	screenLeaveConfirm            // "Leave this chat?" confirmation
+	screenServers             screen = iota // home: list of known servers + verdict badges
+	screenAddServer                         // textinput host:port -> check_server
+	screenVerdict                           // attestation verdict + Cancel/Connect buttons
+	screenUsername                          // username registration on a server
+	screenChat                              // sidebar + messages + input
+	screenMenu                              // server / ping / change-server / docs
+	screenHelp                              // command + key reference
+	screenLeaveConfirm                      // "Leave this chat?" confirmation
+	screenStore                             // plugin store: browse / install / update / submit
+	screenSubmit                            // plugin submission form
+	screenRemoveServerConfirm               // "Remove this server?" confirmation
 )
 
 // menuItemCount is the number of selectable rows on the menu screen.
@@ -58,13 +61,30 @@ func verdictTick() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return verdictTickMsg{} })
 }
 
+// clockTickMsg fires once a second to refresh clock widgets and the local
+// server-maintenance countdown (which is UI state, never stored chat history).
+type clockTickMsg struct{}
+
+func clockTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return clockTickMsg{} })
+}
+
+// reconnectTickMsg drives automatic reconnection while in "waiting for server"
+// mode after a maintenance restart (install_specification §12.4).
+type reconnectTickMsg struct{}
+
+func reconnectTick() tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg { return reconnectTickMsg{} })
+}
+
 // Model is the bubbletea model for the whole TUI.
 type Model struct {
 	core *Core
 
-	// the active server's address (display + chat scope) and the default to
-	// offer when adding a server.
+	// the active server's address (chat scope / commands) and its friendly
+	// display name (shown in the header instead of host:port).
 	serverAddr string
+	serverName string
 
 	// window + layout
 	width, height int
@@ -86,8 +106,12 @@ type Model struct {
 	servers   []ServerInfo
 	serverSel int
 
+	// remove-server confirmation
+	removeServerAddr string
+	removeSel        int // 0 = Remove, 1 = Cancel (defaults to Cancel)
+
 	// add-server / username flow
-	serverInput   textinput.Model // host:port editor (add server)
+	addForm       addServerForm   // address / port / name editor (add server)
 	checking      bool            // a check_server is in flight
 	pendingServer string          // server awaiting a username (need_username)
 	nameInput     textinput.Model // username editor
@@ -117,6 +141,26 @@ type Model struct {
 	menuSel int
 	pingMs  int64 // last measured latency, -1 if unknown
 	docsURL string
+
+	// client identity / update state
+	clientVersion string
+	clientUpdate  *clientUpdateMsg // non-nil while a newer client is available
+
+	// plugin store
+	storePlugins  []StorePlugin
+	storeSel      int
+	storeChecking bool
+	pluginUpdates map[string]string // plugin name -> latest version available
+
+	// plugin submission form
+	submit submitForm
+
+	// active plugin-provided widgets (declarative; bounded by the client)
+	widgets []Widget
+
+	// server maintenance / update countdown (rendered locally, never stored)
+	maintenance      *maintenanceMsg
+	waitingForServer bool
 
 	// transient footer status
 	status  string
@@ -149,33 +193,30 @@ func NewModel(core *Core) Model {
 		docs = d
 	}
 
-	srv := textinput.New()
-	srv.Placeholder = "host:port"
-	srv.Prompt = "> "
-	srv.CharLimit = 128
-	srv.Width = 32
-
 	return Model{
-		core:         core,
-		serverAddr:   server,
-		screen:       screenServers,
-		focus:        focusInput,
-		nameInput:    name,
-		input:        in,
-		serverInput:  srv,
-		viewport:     viewport.New(40, 10),
-		chatByID:     map[string]*chatState{},
-		fingerprints: map[string]string{},
-		pingMs:       -1,
-		docsURL:      docs,
-		status:       "starting cherm-core...",
+		core:          core,
+		serverAddr:    server,
+		screen:        screenServers,
+		focus:         focusInput,
+		nameInput:     name,
+		input:         in,
+		addForm:       newAddServerForm(),
+		viewport:      viewport.New(40, 10),
+		chatByID:      map[string]*chatState{},
+		fingerprints:  map[string]string{},
+		pingMs:        -1,
+		docsURL:       docs,
+		pluginUpdates: map[string]string{},
+		submit:        newSubmitForm(),
+		status:        "starting cherm-core...",
 	}
 }
 
-// Init starts the cursor blink. The core was already started by main, so the
-// startup flow is driven by the "ready" event handled in Update.
+// Init starts the cursor blink and the one-second clock tick (which refreshes
+// clock widgets and any active maintenance countdown). The core was already
+// started by main, so the startup flow is driven by the "ready" event.
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, clockTick())
 }
 
 // cmdSend writes a command to the core off the UI goroutine, surfacing any
@@ -194,6 +235,21 @@ func (m Model) cmdSend(cmd map[string]any) tea.Cmd {
 func (m Model) quitCmd() tea.Cmd {
 	m.core.Stop()
 	return tea.Quit
+}
+
+// selfUpdateMsg is the result of an in-app "Update now".
+type selfUpdateMsg struct {
+	version string
+	err     error
+}
+
+// selfUpdateCmd downloads + verifies + installs the latest client off the UI
+// goroutine (force: the user explicitly chose to update).
+func (m Model) selfUpdateCmd() tea.Cmd {
+	return func() tea.Msg {
+		v, err := selfUpdate(true)
+		return selfUpdateMsg{version: v, err: err}
+	}
 }
 
 // Update is the central event loop.
@@ -226,6 +282,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateHelp(msg)
 		case screenLeaveConfirm:
 			return m.updateLeaveConfirm(msg)
+		case screenStore:
+			return m.updateStore(msg)
+		case screenSubmit:
+			return m.updateSubmit(msg)
+		case screenRemoveServerConfirm:
+			return m.updateRemoveServerConfirm(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -247,11 +309,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.server == "" || msg.server == m.serverAddr {
 			m.connected = false
 		}
+		// If the server announced maintenance, this disconnect is the update
+		// stop: enter "waiting for server" and auto-reconnect (install_spec §12.4).
+		if m.maintenance != nil && (msg.server == "" || msg.server == m.serverAddr) {
+			if !m.waitingForServer {
+				m.waitingForServer = true
+				m.flash("server is restarting — waiting for server…", false)
+				return m, reconnectTick()
+			}
+			return m, nil
+		}
 		m.flash("disconnected: "+msg.reason, true)
 		return m, nil
 	case chatsMsg:
 		m.applyChats(msg.chats)
 		return m, nil
+	case openChatMsg:
+		// Land directly in the conversation (e.g. right after /dm or /group).
+		if m.screen != screenChat {
+			m.screen = screenChat
+			m.focus = focusInput
+			m.input.Focus()
+		}
+		// Keep the sidebar selection in sync with the opened chat.
+		for i, cs := range m.chats {
+			if cs.info.ID == msg.chat {
+				m.sidebarSel = i
+				break
+			}
+		}
+		cmd := m.openChat(msg.chat)
+		return m, cmd
 	case historyMsg:
 		return m.onHistory(msg)
 	case messageMsg:
@@ -273,6 +361,83 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// two at once — that would drain the safety countdown at 2x+ speed.)
 		m.verdictTicking = false
 		return m, nil
+
+	// ---- plugin / theme / widgets / update / maintenance ----
+	case themeMsg:
+		applyPalette(paletteFromEvent(msg.palette))
+		return m, nil
+	case widgetsMsg:
+		m.widgets = msg.widgets
+		return m, nil
+	case storePluginsMsg:
+		m.storePlugins = msg.plugins
+		m.storeChecking = false
+		if m.storeSel >= len(m.storePlugins) {
+			m.storeSel = len(m.storePlugins) - 1
+		}
+		if m.storeSel < 0 {
+			m.storeSel = 0
+		}
+		return m, nil
+	case installedPluginsMsg:
+		// Merge installed/active flags into the store view if we are showing it;
+		// otherwise just remember them by replacing the list when store is empty.
+		m.mergeInstalled(msg.plugins)
+		return m, nil
+	case pluginInstalledMsg:
+		delete(m.pluginUpdates, msg.name)
+		m.flash(fmt.Sprintf("installed %s v%s (%s)", msg.name, msg.version, categoryLabel(msg.category)), false)
+		return m, nil
+	case pluginUpdateMsg:
+		m.pluginUpdates[msg.name] = msg.latest
+		m.flash(fmt.Sprintf("update for %s: v%s → v%s", msg.name, msg.current, msg.latest), false)
+		return m, nil
+	case pluginSubmittedMsg:
+		m.flash(fmt.Sprintf("submitted %s v%s — community unaudited (pending review)", msg.name, msg.version), false)
+		m.screen = screenStore
+		return m, nil
+	case clientUpdateMsg:
+		cu := msg
+		m.clientUpdate = &cu
+		m.flash(fmt.Sprintf("a new Cherm client is available: v%s (you have v%s)", msg.latest, msg.current), false)
+		return m, nil
+	case selfUpdateMsg:
+		if msg.err != nil {
+			m.flash("update failed: "+msg.err.Error(), true)
+			return m, nil
+		}
+		m.clientUpdate = nil
+		m.flash(fmt.Sprintf("updated to v%s — restart cherm to apply (your data is preserved)", msg.version), false)
+		return m, nil
+	case maintenanceMsg:
+		// The perpetual clockTick (started in Init) already drives the per-second
+		// re-render of the countdown — do NOT start a second chain here or it
+		// would tick at 2x.
+		mm := msg
+		m.maintenance = &mm
+		m.flash(msg.reason, false)
+		return m, nil
+	case clockTickMsg:
+		// Drives clock widgets + the maintenance countdown. If a maintenance
+		// deadline has passed, fall into waiting-for-server mode.
+		var cmds []tea.Cmd
+		if m.maintenance != nil && !m.waitingForServer {
+			if remainingSecs(m.maintenance.deadlineMs) <= 0 {
+				m.waitingForServer = true
+				cmds = append(cmds, reconnectTick())
+			}
+		}
+		cmds = append(cmds, clockTick())
+		return m, tea.Batch(cmds...)
+	case reconnectTickMsg:
+		if m.waitingForServer && !m.connected {
+			return m, tea.Batch(
+				m.cmdSend(map[string]any{"cmd": "connect", "server": m.serverAddr}),
+				reconnectTick(),
+			)
+		}
+		return m, nil
+
 	case errorMsg:
 		txt := msg.message
 		if msg.code != "" {
@@ -305,14 +470,22 @@ func (m Model) onReady(msg readyMsg) (tea.Model, tea.Cmd) {
 	m.ready = true
 	m.hasMaster = msg.hasMaster
 	m.servers = msg.servers
+	if msg.clientVersion != "" {
+		m.clientVersion = msg.clientVersion
+	}
+
+	// Automatically check for a newer client on launch; the banner (and
+	// /update-now) appear only if one is available.
+	checkUpdate := m.cmdSend(map[string]any{"cmd": "check_client_update"})
 
 	if len(m.servers) == 0 {
-		return m.openAddServer()
+		mdl, cmd := m.openAddServer()
+		return mdl, tea.Batch(cmd, checkUpdate)
 	}
 	m.screen = screenServers
 	m.serverSel = 0
 	m.status = "select a server to connect"
-	return m, textinput.Blink
+	return m, tea.Batch(textinput.Blink, checkUpdate)
 }
 
 // onServers refreshes the known-servers list and keeps the selection in range.
@@ -327,6 +500,7 @@ func (m Model) onServers(msg serversMsg) (tea.Model, tea.Cmd) {
 	for _, s := range m.servers {
 		if s.Active {
 			m.serverAddr = s.Addr
+			m.serverName = s.Name
 			if s.Username != "" {
 				m.username = s.Username
 			}
@@ -399,6 +573,17 @@ func (m Model) onConnected(msg connectedMsg) (tea.Model, tea.Cmd) {
 	if who == "" {
 		who = "-"
 	}
+	// Returning from a maintenance restart: clear the waiting state and confirm.
+	if m.waitingForServer || m.maintenance != nil {
+		ver := ""
+		if m.maintenance != nil && m.maintenance.version != "" {
+			ver = " (now v" + m.maintenance.version + ")"
+		}
+		m.waitingForServer = false
+		m.maintenance = nil
+		m.flash("connected — server updated successfully"+ver, false)
+		return m.enterChat(), m.afterEnterCmd()
+	}
 	m.flash(fmt.Sprintf("connected to %s as %s", m.serverAddr, who), false)
 	return m.enterChat(), m.afterEnterCmd()
 }
@@ -409,7 +594,7 @@ func (m Model) enterChat() Model {
 	m.focus = focusInput
 	m.input.Focus()
 	m.nameInput.Blur()
-	m.serverInput.Blur()
+	m.addForm.blurAll()
 	m.onboardErr = ""
 	m.layout()
 	return m
@@ -445,6 +630,8 @@ func (m Model) updateServers(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "a":
 		return m.openAddServer()
+	case "x":
+		return m.openRemoveServerConfirm()
 	case "enter":
 		return m.connectSelected()
 	case "esc":
@@ -465,47 +652,74 @@ func (m Model) connectSelected() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	s := m.servers[m.serverSel]
+	m.serverName = s.Name
 	if s.Active && m.connected {
 		m.serverAddr = s.Addr
 		return m.enterChat(), textinput.Blink
 	}
-	m.flash("connecting to "+s.Addr+"...", false)
+	label := s.Name
+	if label == "" {
+		label = s.Addr
+	}
+	m.flash("connecting to "+label+"...", false)
 	return m, m.cmdSend(map[string]any{"cmd": "connect", "server": s.Addr})
 }
 
-// openAddServer switches to the add-server screen, prefilled with the default
-// server address for convenience.
+// openAddServer switches to the add-server screen with an empty address / port
+// / name form (the official server is already seeded in the list).
 func (m Model) openAddServer() (tea.Model, tea.Cmd) {
 	m.screen = screenAddServer
 	m.checking = false
-	m.serverInput.SetValue(m.serverAddr)
-	m.serverInput.Focus()
-	m.serverInput.CursorEnd()
+	m.addForm.reset()
 	m.flash("", false)
 	return m, textinput.Blink
 }
 
-// ---- add server ----
+// ---- add server (form in addserver.go) ----
 
 func (m Model) updateAddServer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.serverInput.Blur()
+		m.addForm.blurAll()
 		m.screen = screenServers
 		return m, nil
+	case "tab", "down":
+		m.addForm.focus(m.addForm.sel + 1)
+		return m, nil
+	case "shift+tab", "up":
+		m.addForm.focus(m.addForm.sel - 1)
+		return m, nil
 	case "enter":
-		addr := strings.TrimSpace(m.serverInput.Value())
-		if addr == "" {
-			m.flash("server address cannot be empty", true)
+		// Enter advances through the fields; only submits from the last one.
+		if m.addForm.sel < 2 {
+			m.addForm.focus(m.addForm.sel + 1)
 			return m, nil
 		}
-		m.checking = true
-		m.flash("checking "+addr+"...", false)
-		return m, m.cmdSend(map[string]any{"cmd": "check_server", "server": addr})
+		return m.submitAddServer()
+	case "ctrl+s":
+		return m.submitAddServer()
 	}
 	var cmd tea.Cmd
-	m.serverInput, cmd = m.serverInput.Update(msg)
+	*m.addForm.inputs()[m.addForm.sel], cmd = m.addForm.inputs()[m.addForm.sel].Update(msg)
 	return m, cmd
+}
+
+// submitAddServer builds host:port from the form, attaches the user's name, and
+// asks the core to attest it (which also records the name in the server list).
+func (m Model) submitAddServer() (tea.Model, tea.Cmd) {
+	addr := combineHostPort(m.addForm.address.Value(), m.addForm.port.Value())
+	if addr == "" {
+		m.flash("server address cannot be empty", true)
+		return m, nil
+	}
+	name := strings.TrimSpace(m.addForm.name.Value())
+	m.checking = true
+	label := name
+	if label == "" {
+		label = addr
+	}
+	m.flash("checking "+label+"...", false)
+	return m, m.cmdSend(map[string]any{"cmd": "check_server", "server": addr, "name": name})
 }
 
 // ---- verdict ----
@@ -731,6 +945,53 @@ func (m Model) runCommand(line string) (tea.Model, tea.Cmd) {
 	case "/servers":
 		return m.openServersScreen()
 
+	case "/store", "/plugins":
+		return m.openStore()
+
+	case "/submit":
+		return m.openSubmit()
+
+	case "/update":
+		m.flash("checking for a newer Cherm client…", false)
+		return m, m.cmdSend(map[string]any{"cmd": "check_client_update"})
+
+	case "/update-now":
+		if m.clientUpdate == nil {
+			m.flash("no client update available", true)
+			return m, nil
+		}
+		m.flash("downloading & verifying the update…", false)
+		return m, m.selfUpdateCmd()
+
+	case "/update-notes":
+		if m.clientUpdate == nil || m.clientUpdate.notesURL == "" {
+			m.flash("no release notes available", true)
+			return m, nil
+		}
+		if err := openBrowser(m.clientUpdate.notesURL); err != nil {
+			m.flash("could not open browser: "+err.Error(), true)
+		} else {
+			m.flash("opened release notes", false)
+		}
+		return m, nil
+
+	case "/update-ignore":
+		m.clientUpdate = nil
+		m.flash("update notice dismissed", false)
+		return m, nil
+
+	case "/export":
+		m.flash("exporting your identity backup…", false)
+		return m, m.cmdSend(map[string]any{"cmd": "export_identity"})
+
+	case "/import":
+		if len(args) != 1 {
+			m.flash("usage: /import <path-to-.chermkey-file>", true)
+			return m, nil
+		}
+		m.flash("importing identity from "+args[0]+"…", false)
+		return m, m.cmdSend(map[string]any{"cmd": "import_identity", "path": args[0]})
+
 	case "/menu":
 		return m.openMenu()
 
@@ -752,7 +1013,7 @@ func (m Model) openMenu() (tea.Model, tea.Cmd) {
 	m.screen = screenMenu
 	m.menuSel = 0
 	m.input.Blur()
-	m.serverInput.Blur()
+	m.addForm.blurAll()
 	return m, m.cmdSend(map[string]any{"cmd": "ping"})
 }
 
@@ -773,7 +1034,7 @@ func (m Model) openServersScreen() (tea.Model, tea.Cmd) {
 func (m Model) backToChat() (tea.Model, tea.Cmd) {
 	m.screen = screenChat
 	m.focus = focusInput
-	m.serverInput.Blur()
+	m.addForm.blurAll()
 	m.input.Focus()
 	return m, textinput.Blink
 }
@@ -876,6 +1137,42 @@ func (m Model) updateLeaveConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Cancel — nothing changes.
 		m.screen = screenChat
+		return m, nil
+	}
+	return m, nil
+}
+
+// ---- remove-server confirmation ----
+
+// openRemoveServerConfirm starts the "Remove this server?" flow for the
+// highlighted server. Removing is destructive (drops the local vault), so it
+// only happens after explicit confirmation (default = Cancel).
+func (m Model) openRemoveServerConfirm() (tea.Model, tea.Cmd) {
+	if m.serverSel < 0 || m.serverSel >= len(m.servers) {
+		return m, nil
+	}
+	m.removeServerAddr = m.servers[m.serverSel].Addr
+	m.removeSel = 1 // default to Cancel — removal is destructive
+	m.screen = screenRemoveServerConfirm
+	return m, nil
+}
+
+func (m Model) updateRemoveServerConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "h", "right", "l", "tab", "shift+tab":
+		m.removeSel = 1 - m.removeSel
+		return m, nil
+	case "esc":
+		m.screen = screenServers
+		return m, nil
+	case "enter":
+		if m.removeSel == 0 { // Remove
+			addr := m.removeServerAddr
+			m.screen = screenServers
+			m.flash("removing "+addr+"...", false)
+			return m, m.cmdSend(map[string]any{"cmd": "remove_server", "server": addr})
+		}
+		m.screen = screenServers // Cancel
 		return m, nil
 	}
 	return m, nil
@@ -988,6 +1285,15 @@ func (m *Model) flash(text string, isErr bool) {
 	m.isError = isErr
 }
 
+// displayServer returns the active server's friendly name, falling back to its
+// host:port address when no name is known.
+func (m Model) displayServer() string {
+	if m.serverName != "" {
+		return m.serverName
+	}
+	return m.serverAddr
+}
+
 // currentFingerprint returns the safety number of the open DM's peer, if known.
 func (m Model) currentFingerprint() string {
 	cs := m.chatByID[m.current]
@@ -1068,6 +1374,12 @@ func (m Model) View() string {
 		return m.helpView()
 	case screenLeaveConfirm:
 		return m.leaveConfirmView()
+	case screenStore:
+		return m.storeView()
+	case screenSubmit:
+		return m.submitView()
+	case screenRemoveServerConfirm:
+		return m.removeServerConfirmView()
 	default:
 		return m.chatView()
 	}

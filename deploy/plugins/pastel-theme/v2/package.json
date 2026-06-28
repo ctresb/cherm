@@ -1,0 +1,16 @@
+{
+  "theme": {
+    "magenta": "#E0A3FF",
+    "pink": "#FFB3C7",
+    "dark": "#2A2433",
+    "white": "#FBF5FF",
+    "border": "#5C5470",
+    "muted": "#A89BB8",
+    "green": "#A6E3A1",
+    "yellow": "#F9E2AF",
+    "red": "#F5A9B8"
+  },
+  "widgets": [
+    { "slot": "top_right", "kind": "clock", "format": "15:04:05" }
+  ]
+}
